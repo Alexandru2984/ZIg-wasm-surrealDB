@@ -1,0 +1,13 @@
+#V2
+-- Create users table
+DEFINE TABLE users SCHEMAFULL;
+DEFINE FIELD email ON users TYPE string;
+DEFINE FIELD password ON users TYPE string;
+DEFINE FIELD name ON users TYPE string;
+DEFINE INDEX email_idx ON users FIELDS email UNIQUE;
+-- Create tasks table  
+DEFINE TABLE tasks SCHEMAFULL;
+DEFINE FIELD title ON tasks TYPE string;
+DEFINE FIELD completed ON tasks TYPE bool DEFAULT false;
+DEFINE FIELD user_id ON tasks TYPE string;
+DEFINE FIELD created_at ON tasks TYPE datetime DEFAULT time::now();
