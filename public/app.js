@@ -415,26 +415,84 @@ async function loadTasks() {
 function renderTasks(tasks) {
     taskList.innerHTML = '';
     
-    if (tasks.length === 0) {
+    // Get completed task list element
+    const completedTaskList = document.getElementById('completedTaskList');
+    const completedSection = document.getElementById('completedSection');
+    completedTaskList.innerHTML = '';
+    
+    // Date formatting helper
+    function formatDate(dateStr) {
+        if (!dateStr) return '';
+        try {
+            const date = new Date(dateStr);
+            return date.toLocaleDateString('ro-RO', { 
+                day: '2-digit', 
+                month: 'short',
+                hour: '2-digit',
+                minute: '2-digit'
+            });
+        } catch {
+            return dateStr;
+        }
+    }
+    
+    // Separate active and completed tasks
+    const activeTasks = tasks.filter(t => !t.completed);
+    const completedTasks = tasks.filter(t => t.completed);
+    
+    if (activeTasks.length === 0 && completedTasks.length === 0) {
         emptyState.classList.add('visible');
+        completedSection.style.display = 'none';
     } else {
         emptyState.classList.remove('visible');
         
-        let completed = 0;
-        tasks.forEach(task => {
-            if (task.completed) completed++;
-            
+        // Render active tasks
+        activeTasks.forEach(task => {
             const li = document.createElement('li');
-            li.className = `task-item${task.completed ? ' completed' : ''}`;
+            li.className = 'task-item';
+            
+            const createdDate = formatDate(task.created_at);
+            const dueDate = task.due_date ? formatDate(task.due_date) : '';
+            const dueDateHtml = dueDate ? `<span class="task-due">📅 ${dueDate}</span>` : '';
+            const createdHtml = createdDate ? `<span class="task-created">🕐 ${createdDate}</span>` : '';
+            
             li.innerHTML = `
-                <input type="checkbox" class="task-checkbox" ${task.completed ? 'checked' : ''} data-id="${task.id}">
-                <span class="task-title">${escapeHtml(task.title)}</span>
+                <input type="checkbox" class="task-checkbox" data-id="${task.id}">
+                <div class="task-content">
+                    <span class="task-title">${escapeHtml(task.title)}</span>
+                    <div class="task-meta">${createdHtml}${dueDateHtml}</div>
+                </div>
                 <button class="btn-delete" data-id="${task.id}" title="Delete task">🗑️</button>
             `;
             taskList.appendChild(li);
         });
+        
+        // Render completed tasks
+        if (completedTasks.length > 0) {
+            completedSection.style.display = 'block';
+            completedTasks.forEach(task => {
+                const li = document.createElement('li');
+                li.className = 'task-item completed';
+                
+                const createdDate = formatDate(task.created_at);
+                const dueDate = task.due_date ? formatDate(task.due_date) : '';
+                const createdHtml = createdDate ? `<span class="task-created">🕐 ${createdDate}</span>` : '';
+                
+                li.innerHTML = `
+                    <input type="checkbox" class="task-checkbox" checked data-id="${task.id}">
+                    <div class="task-content">
+                        <span class="task-title">${escapeHtml(task.title)}</span>
+                        <div class="task-meta">${createdHtml}</div>
+                    </div>
+                    <button class="btn-delete" data-id="${task.id}" title="Delete task">🗑️</button>
+                `;
+                completedTaskList.appendChild(li);
+            });
+        } else {
+            completedSection.style.display = 'none';
+        }
 
-        completedCount.textContent = completed;
+        completedCount.textContent = completedTasks.length;
     }
     
     totalCount.textContent = tasks.length;
@@ -446,17 +504,22 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-async function addTask(title) {
+async function addTask(title, dueDate = null) {
     if (isLoggedIn()) {
         // Logged in: save to API
         try {
+            const taskData = { title };
+            if (dueDate) {
+                taskData.due_date = dueDate;
+            }
+            
             const response = await fetch('/api/tasks', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                     'Authorization': `Bearer ${getToken()}`
                 },
-                body: JSON.stringify({ title })
+                body: JSON.stringify(taskData)
             });
 
             if (response.ok) {
@@ -547,14 +610,34 @@ taskForm.addEventListener('submit', (e) => {
     const title = taskInput.value.trim();
     if (!title) return;
     
-    addTask(title);
+    const dueDateInput = document.getElementById('taskDueDate');
+    const dueDate = dueDateInput.value || null;
+    
+    addTask(title, dueDate);
     taskInput.value = '';
+    dueDateInput.value = '';
     taskInput.focus();
 });
 
 taskList.addEventListener('click', (e) => {
     const target = e.target;
-    const id = parseInt(target.dataset.id) || parseFloat(target.dataset.id);
+    const id = target.dataset.id;  // Use string ID directly for SurrealDB
+    
+    if (!id) return;  // No ID on this element
+    
+    if (target.classList.contains('task-checkbox')) {
+        toggleTask(id);
+    } else if (target.classList.contains('btn-delete')) {
+        deleteTask(id);
+    }
+});
+
+// Also handle click events on completed task list
+document.getElementById('completedTaskList').addEventListener('click', (e) => {
+    const target = e.target;
+    const id = target.dataset.id;
+    
+    if (!id) return;
     
     if (target.classList.contains('task-checkbox')) {
         toggleTask(id);

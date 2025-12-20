@@ -131,6 +131,8 @@ pub fn initSchema(allocator: std.mem.Allocator) !void {
         \\DEFINE FIELD user_id ON tasks TYPE string;
         \\DEFINE FIELD title ON tasks TYPE string;
         \\DEFINE FIELD completed ON tasks TYPE bool DEFAULT false;
+        \\DEFINE FIELD created_at ON tasks TYPE datetime DEFAULT time::now();
+        \\DEFINE FIELD due_date ON tasks TYPE option<datetime>;
     ;
 
     const tasks_result = try query(allocator, tasks_schema);
@@ -226,8 +228,17 @@ pub fn getUserByVerificationToken(allocator: std.mem.Allocator, token: []const u
 
 pub fn createTask(allocator: std.mem.Allocator, user_id: []const u8, title: []const u8) ![]u8 {
     const sql = try std.fmt.allocPrint(allocator,
-        \\CREATE tasks SET user_id = "{s}", title = "{s}", completed = false;
+        \\CREATE tasks SET user_id = "{s}", title = "{s}", completed = false, created_at = time::now();
     , .{ user_id, title });
+    defer allocator.free(sql);
+
+    return try query(allocator, sql);
+}
+
+pub fn createTaskWithDueDate(allocator: std.mem.Allocator, user_id: []const u8, title: []const u8, due_date: []const u8) ![]u8 {
+    const sql = try std.fmt.allocPrint(allocator,
+        \\CREATE tasks SET user_id = "{s}", title = "{s}", completed = false, created_at = time::now(), due_date = <datetime>"{s}";
+    , .{ user_id, title, due_date });
     defer allocator.free(sql);
 
     return try query(allocator, sql);

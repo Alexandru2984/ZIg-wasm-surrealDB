@@ -363,25 +363,47 @@ fn createTask(r: zap.Request) !void {
         return;
     };
 
-    // Create task in SurrealDB
-    const db_result = db.createTask(allocator, user_id, title) catch {
-        r.setStatus(.internal_server_error);
-        try r.sendBody("{\"error\": \"Failed to create task\"}");
-        return;
-    };
+    // Check if due_date is provided
+    const due_date = parseJsonField(body, "due_date");
+    
+    // Create task in SurrealDB (with or without due_date)
+    const db_result = if (due_date) |dd|
+        db.createTaskWithDueDate(allocator, user_id, title, dd) catch {
+            r.setStatus(.internal_server_error);
+            try r.sendBody("{\"error\": \"Failed to create task\"}");
+            return;
+        }
+    else
+        db.createTask(allocator, user_id, title) catch {
+            r.setStatus(.internal_server_error);
+            try r.sendBody("{\"error\": \"Failed to create task\"}");
+            return;
+        };
     defer allocator.free(db_result);
     
     const task_id = parseJsonField(db_result, "id") orelse "unknown";
+    const created_at = parseJsonField(db_result, "created_at") orelse "";
     std.debug.print("✅ Task created: {s}\n", .{task_id});
 
-    var response: [256]u8 = undefined;
-    const len = (std.fmt.bufPrint(&response, "{{\"id\":\"{s}\",\"title\":\"{s}\",\"completed\":false}}", .{
-        task_id,
-        title,
-    }) catch &response).len;
-
-    r.setStatus(.created);
-    try r.sendBody(response[0..len]);
+    var response: [512]u8 = undefined;
+    if (due_date) |dd| {
+        const len = (std.fmt.bufPrint(&response, "{{\"id\":\"{s}\",\"title\":\"{s}\",\"completed\":false,\"created_at\":\"{s}\",\"due_date\":\"{s}\"}}", .{
+            task_id,
+            title,
+            created_at,
+            dd,
+        }) catch &response).len;
+        r.setStatus(.created);
+        try r.sendBody(response[0..len]);
+    } else {
+        const len = (std.fmt.bufPrint(&response, "{{\"id\":\"{s}\",\"title\":\"{s}\",\"completed\":false,\"created_at\":\"{s}\"}}", .{
+            task_id,
+            title,
+            created_at,
+        }) catch &response).len;
+        r.setStatus(.created);
+        try r.sendBody(response[0..len]);
+    }
 }
 
 fn toggleTask(r: zap.Request, task_id: []const u8) !void {

@@ -60,6 +60,12 @@
                         autocomplete="off"
                         required
                     >
+                    <input 
+                        type="datetime-local" 
+                        id="taskDueDate" 
+                        class="task-due-input"
+                        title="Due date (optional)"
+                    >
                     <button type="submit" class="btn-add">
                         <span class="btn-icon">+</span>
                         <span class="btn-text">Add</span>
@@ -76,12 +82,20 @@
                 </span>
             </div>
 
+
             <ul class="task-list" id="taskList">
             </ul>
 
             <div class="empty-state" id="emptyState">
                 <div class="empty-icon">📝</div>
                 <p>No tasks yet. Add one above!</p>
+            </div>
+
+            <!-- Completed Tasks Section -->
+            <div class="completed-section" id="completedSection" style="display: none;">
+                <h3 class="section-title">✅ Completed Tasks</h3>
+                <ul class="task-list task-list-completed" id="completedTaskList">
+                </ul>
             </div>
         </main>
 
