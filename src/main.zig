@@ -2,6 +2,7 @@ const std = @import("std");
 const zap = @import("zap");
 const auth = @import("auth.zig");
 const email = @import("email.zig");
+const db = @import("db.zig");
 
 // User structure with profile and verification fields
 const User = struct {
@@ -9,21 +10,22 @@ const User = struct {
     email: []const u8,
     password_hash: []const u8,
     name: []const u8,
-    avatar: ?[]const u8 = null,           // Base64 or URL
+    avatar: ?[]const u8 = null,
     email_verified: bool = false,
     verification_token: ?[]const u8 = null,
     reset_token: ?[]const u8 = null,
     reset_expires: ?i64 = null,
 };
 
-// Task now has user_id
+// Task structure
 const Task = struct {
     id: u32,
     title: []const u8,
-    completed: bool,
+    completed: bool = false,
     user_id: u32,
 };
 
+// Keep legacy ArrayLists for now (will be removed after full migration)
 var users: std.ArrayListUnmanaged(User) = .empty;
 var tasks: std.ArrayListUnmanaged(Task) = .empty;
 var next_user_id: u32 = 1;
@@ -34,6 +36,11 @@ pub fn main() !void {
     allocator = std.heap.page_allocator;
     defer users.deinit(allocator);
     defer tasks.deinit(allocator);
+
+    // Initialize SurrealDB schema
+    db.initSchema(allocator) catch |err| {
+        std.debug.print("⚠️ Could not initialize DB schema: {} (continuing anyway)\n", .{err});
+    };
 
     var listener = zap.HttpListener.init(.{
         .port = 9000,
@@ -213,6 +220,14 @@ fn handleSignup(r: zap.Request) !void {
     next_user_id += 1;
 
     try users.append(allocator, user);
+
+    // Persist to SurrealDB
+    if (db.createUser(allocator, user.email, password_hash, user.name, verification_code)) |result| {
+        std.debug.print("✅ User saved to DB\n", .{});
+        allocator.free(result);
+    } else |err| {
+        std.debug.print("⚠️ Failed to save user to DB: {}\n", .{err});
+    }
 
     // Send confirmation email (async - don't block)
     email.sendConfirmationEmail(allocator, user.email, user.name, verification_code) catch |err| {
