@@ -30,3 +30,4 @@ surreal.db/
 # Environment
 .env
 .env.local
+mail_settings.txt

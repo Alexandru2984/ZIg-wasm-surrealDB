@@ -67,6 +67,22 @@ function showLoggedIn(user) {
     userName.textContent = user.name;
     userEmail.textContent = user.email;
     userAvatar.textContent = user.name.charAt(0).toUpperCase();
+
+    // Update Profile Modal
+    document.getElementById('profileName').textContent = user.name;
+    document.getElementById('profileEmail').textContent = user.email;
+    document.getElementById('profileAvatar').textContent = user.name.charAt(0).toUpperCase();
+    document.getElementById('profileNameInput').value = user.name;
+
+    const badge = document.getElementById('profileVerified');
+    if (user.email_verified) {
+        badge.innerHTML = '<span class="badge badge-success">✅ Verified</span>';
+    } else {
+        badge.innerHTML = `
+            <span class="badge badge-warning">⚠️ Not Verified</span>
+            <a href="#" onclick="showModal('verifyModal'); hideModal('profileModal')" style="font-size: 0.8rem; margin-left: 0.5rem; color: var(--accent-primary)">Verify Now</a>
+        `;
+    }
 }
 
 function showLoggedOut() {
@@ -123,6 +139,8 @@ function hideModal(id) {
     document.getElementById(id).classList.remove('active');
     const error = document.querySelector(`#${id} .form-error`);
     if (error) error.textContent = '';
+    const success = document.querySelector(`#${id} .form-success`);
+    if (success) success.classList.add('hidden');
 }
 
 function switchModal(fromId, toId) {
@@ -155,6 +173,9 @@ async function handleSignup(e) {
             hideModal('signupModal');
             document.getElementById('signupForm').reset();
             loadTasks();
+            
+            // Show verify modal
+            showModal('verifyModal');
         } else {
             errorEl.textContent = data.error || 'Signup failed';
         }
@@ -197,6 +218,174 @@ function logout() {
     removeToken();
     showLoggedOut();
     loadTasks(); // Will now load from localStorage
+}
+
+// ============ PROFILE & VERIFICATION HANDLERS ============
+
+function switchProfileTab(tabName) {
+    // Buttons
+    document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+    event.target.classList.add('active');
+    
+    // Content
+    document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+    if (tabName === 'edit') {
+        document.getElementById('tabEdit').classList.add('active');
+    } else if (tabName === 'password') {
+        document.getElementById('tabPassword').classList.add('active');
+    }
+}
+
+async function handleUpdateProfile(e) {
+    e.preventDefault();
+    const name = document.getElementById('profileNameInput').value;
+    const errorEl = document.getElementById('profileError');
+    const successEl = document.getElementById('profileSuccess');
+    
+    try {
+        const response = await fetch('/api/profile', {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${getToken()}`
+            },
+            body: JSON.stringify({ name })
+        });
+        
+        if (response.ok) {
+            const user = await response.json();
+            currentUser = user;
+            showLoggedIn(user); // Update UI
+            successEl.classList.remove('hidden');
+            errorEl.textContent = '';
+            setTimeout(() => successEl.classList.add('hidden'), 3000);
+        } else {
+            errorEl.textContent = 'Failed to update profile';
+        }
+    } catch (error) {
+        errorEl.textContent = 'Connection error';
+    }
+}
+
+async function handleChangePassword(e) {
+    e.preventDefault();
+    const currentPassword = document.getElementById('currentPassword').value;
+    const newPassword = document.getElementById('newPassword').value;
+    const confirmPassword = document.getElementById('confirmPassword').value;
+    const errorEl = document.getElementById('passwordError');
+    const successEl = document.getElementById('passwordSuccess');
+    
+    if (newPassword !== confirmPassword) {
+        errorEl.textContent = 'Passwords do not match';
+        return;
+    }
+    
+    try {
+        const response = await fetch('/api/profile/password', {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${getToken()}`
+            },
+            body: JSON.stringify({ current_password: currentPassword, new_password: newPassword })
+        });
+        
+        if (response.ok) {
+            successEl.classList.remove('hidden');
+            errorEl.textContent = '';
+            document.getElementById('passwordForm').reset();
+            setTimeout(() => successEl.classList.add('hidden'), 3000);
+        } else {
+            const data = await response.json();
+            errorEl.textContent = data.error || 'Failed to change password';
+        }
+    } catch (error) {
+        errorEl.textContent = 'Connection error';
+    }
+}
+
+async function handleForgotPassword(e) {
+    e.preventDefault();
+    const email = document.getElementById('forgotEmail').value;
+    const errorEl = document.getElementById('forgotError');
+    const successEl = document.getElementById('forgotSuccess');
+    
+    try {
+        const response = await fetch('/api/auth/forgot-password', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email })
+        });
+        
+        // Always show success
+        successEl.classList.remove('hidden');
+        errorEl.textContent = '';
+        document.getElementById('forgotForm').reset();
+    } catch (error) {
+        errorEl.textContent = 'Connection error';
+    }
+}
+
+// Verification Code Logic
+function handleCodeInput(input, index) {
+    // Auto-focus next input
+    if (input.value.length === 1) {
+        input.classList.add('filled');
+        const next = document.querySelectorAll('.code-input')[index + 1];
+        if (next) next.focus();
+    } else {
+        input.classList.remove('filled');
+    }
+    
+    // Handle backspace
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Backspace' && input.value.length === 0) {
+            const prev = document.querySelectorAll('.code-input')[index - 1];
+            if (prev) {
+                prev.focus();
+                prev.value = '';
+                prev.classList.remove('filled');
+            }
+        }
+    });
+}
+
+async function handleVerifyEmail(e) {
+    e.preventDefault();
+    const inputs = document.querySelectorAll('.code-input');
+    let code = '';
+    inputs.forEach(input => code += input.value);
+    
+    const errorEl = document.getElementById('verifyError');
+    const successEl = document.getElementById('verifySuccess');
+    
+    if (code.length !== 6) {
+        errorEl.textContent = 'Please enter the full 6-digit code';
+        return;
+    }
+    
+    try {
+        const response = await fetch('/api/auth/verify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code })
+        });
+        
+        if (response.ok) {
+            successEl.classList.remove('hidden');
+            errorEl.textContent = '';
+            setTimeout(() => {
+                hideModal('verifyModal');
+                // Refresh user data
+                checkAuth();
+            }, 2000);
+        } else {
+            const data = await response.json();
+            errorEl.textContent = data.error || 'Verification failed';
+        }
+    } catch (error) {
+        errorEl.textContent = 'Connection error';
+    }
 }
 
 // ============ TASK FUNCTIONS ============

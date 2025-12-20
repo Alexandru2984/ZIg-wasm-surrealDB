@@ -51,3 +51,8 @@ pub fn validateToken(allocator: std.mem.Allocator, token: []const u8) !?[]const 
     
     return user_id;
 }
+
+pub fn generateVerificationCode(allocator: std.mem.Allocator) ![]u8 {
+    const code = std.crypto.random.intRangeAtMost(u32, 100000, 999999);
+    return try std.fmt.allocPrint(allocator, "{d}", .{code});
+}

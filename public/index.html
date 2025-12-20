@@ -32,6 +32,9 @@
                             <span class="user-email" id="userEmail">user@example.com</span>
                         </div>
                         <hr>
+                        <button class="dropdown-item" onclick="showModal('profileModal')">
+                            👤 Profile
+                        </button>
                         <button class="dropdown-item" onclick="logout()">
                             🚪 Logout
                         </button>
@@ -107,6 +110,9 @@
                 <button type="submit" class="btn-submit">Login</button>
             </form>
             <p class="modal-footer">
+                <a href="#" onclick="switchModal('loginModal', 'forgotModal')">Forgot password?</a>
+            </p>
+            <p class="modal-footer">
                 Don't have an account? <a href="#" onclick="switchModal('loginModal', 'signupModal')">Sign up</a>
             </p>
         </div>
@@ -137,6 +143,112 @@
             <p class="modal-footer">
                 Already have an account? <a href="#" onclick="switchModal('signupModal', 'loginModal')">Login</a>
             </p>
+        </div>
+    </div>
+
+    <!-- Verify Email Modal -->
+    <div class="modal" id="verifyModal">
+        <div class="modal-overlay" onclick="hideModal('verifyModal')"></div>
+        <div class="modal-content">
+            <button class="modal-close" onclick="hideModal('verifyModal')">×</button>
+            <h2>Verify Email</h2>
+            <p class="modal-desc">Enter the 6-digit code sent to your email.</p>
+            <form id="verifyForm" onsubmit="handleVerifyEmail(event)">
+                <div class="code-input-group">
+                    <input type="text" class="code-input" maxlength="1" pattern="[0-9]" required onkeyup="handleCodeInput(this, 0)">
+                    <input type="text" class="code-input" maxlength="1" pattern="[0-9]" required onkeyup="handleCodeInput(this, 1)">
+                    <input type="text" class="code-input" maxlength="1" pattern="[0-9]" required onkeyup="handleCodeInput(this, 2)">
+                    <input type="text" class="code-input" maxlength="1" pattern="[0-9]" required onkeyup="handleCodeInput(this, 3)">
+                    <input type="text" class="code-input" maxlength="1" pattern="[0-9]" required onkeyup="handleCodeInput(this, 4)">
+                    <input type="text" class="code-input" maxlength="1" pattern="[0-9]" required onkeyup="handleCodeInput(this, 5)">
+                </div>
+                <div class="form-error" id="verifyError"></div>
+                <div class="form-success hidden" id="verifySuccess">✅ Email verified successfully!</div>
+                <button type="submit" class="btn-submit">Verify Account</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Forgot Password Modal -->
+    <div class="modal" id="forgotModal">
+        <div class="modal-overlay" onclick="hideModal('forgotModal')"></div>
+        <div class="modal-content">
+            <button class="modal-close" onclick="hideModal('forgotModal')">×</button>
+            <h2>Reset Password</h2>
+            <p class="modal-desc">Enter your email and we'll send you a reset link.</p>
+            <form id="forgotForm" onsubmit="handleForgotPassword(event)">
+                <div class="form-group">
+                    <label for="forgotEmail">Email</label>
+                    <input type="email" id="forgotEmail" required placeholder="you@example.com">
+                </div>
+                <div class="form-error" id="forgotError"></div>
+                <div class="form-success hidden" id="forgotSuccess">
+                    ✅ If this email exists, a reset link has been sent!
+                </div>
+                <button type="submit" class="btn-submit">Send Reset Link</button>
+            </form>
+            <p class="modal-footer">
+                <a href="#" onclick="switchModal('forgotModal', 'loginModal')">← Back to login</a>
+            </p>
+        </div>
+    </div>
+
+    <!-- Profile Modal -->
+    <div class="modal" id="profileModal">
+        <div class="modal-overlay" onclick="hideModal('profileModal')"></div>
+        <div class="modal-content modal-lg">
+            <button class="modal-close" onclick="hideModal('profileModal')">×</button>
+            <h2>Your Profile</h2>
+            
+            <div class="profile-header">
+                <div class="profile-avatar" id="profileAvatar">U</div>
+                <div class="profile-info">
+                    <div class="profile-name" id="profileName">User</div>
+                    <div class="profile-email" id="profileEmail">user@example.com</div>
+                    <div class="profile-badge" id="profileVerified">
+                        <span class="badge badge-warning">⚠️ Email not verified</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="profile-tabs">
+                <button class="tab-btn active" onclick="switchProfileTab('edit')">Edit Profile</button>
+                <button class="tab-btn" onclick="switchProfileTab('password')">Change Password</button>
+            </div>
+
+            <!-- Edit Profile Tab -->
+            <div class="tab-content active" id="tabEdit">
+                <form id="profileForm" onsubmit="handleUpdateProfile(event)">
+                    <div class="form-group">
+                        <label for="profileNameInput">Name</label>
+                        <input type="text" id="profileNameInput" required placeholder="Your name">
+                    </div>
+                    <div class="form-error" id="profileError"></div>
+                    <div class="form-success hidden" id="profileSuccess">✅ Profile updated!</div>
+                    <button type="submit" class="btn-submit">Save Changes</button>
+                </form>
+            </div>
+
+            <!-- Change Password Tab -->
+            <div class="tab-content" id="tabPassword">
+                <form id="passwordForm" onsubmit="handleChangePassword(event)">
+                    <div class="form-group">
+                        <label for="currentPassword">Current Password</label>
+                        <input type="password" id="currentPassword" required placeholder="••••••••">
+                    </div>
+                    <div class="form-group">
+                        <label for="newPassword">New Password</label>
+                        <input type="password" id="newPassword" required minlength="4" placeholder="••••••••">
+                    </div>
+                    <div class="form-group">
+                        <label for="confirmPassword">Confirm New Password</label>
+                        <input type="password" id="confirmPassword" required minlength="4" placeholder="••••••••">
+                    </div>
+                    <div class="form-error" id="passwordError"></div>
+                    <div class="form-success hidden" id="passwordSuccess">✅ Password changed!</div>
+                    <button type="submit" class="btn-submit">Change Password</button>
+                </form>
+            </div>
         </div>
     </div>
 
