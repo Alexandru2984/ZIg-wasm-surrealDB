@@ -477,12 +477,13 @@ function renderTasks(tasks) {
                 const createdDate = formatDate(task.created_at);
                 const dueDate = task.due_date ? formatDate(task.due_date) : '';
                 const createdHtml = createdDate ? `<span class="task-created">🕐 ${createdDate}</span>` : '';
+                const dueDateHtml = dueDate ? `<span class="task-due">📅 ${dueDate}</span>` : '';
                 
                 li.innerHTML = `
                     <input type="checkbox" class="task-checkbox" checked data-id="${task.id}">
                     <div class="task-content">
                         <span class="task-title">${escapeHtml(task.title)}</span>
-                        <div class="task-meta">${createdHtml}</div>
+                        <div class="task-meta">${createdHtml}${dueDateHtml}</div>
                     </div>
                     <button class="btn-delete" data-id="${task.id}" title="Delete task">🗑️</button>
                 `;
@@ -605,6 +606,60 @@ async function initWasm() {
 
 // ============ EVENT LISTENERS ============
 
+// Date picker functionality
+const datePickerBtn = document.getElementById('datePickerBtn');
+const dateClearBtn = document.getElementById('dateClearBtn');
+const datePreview = document.getElementById('datePreview');
+const datePickerWrapper = document.querySelector('.date-picker-wrapper');
+
+function updateDatePreview() {
+    const dueDateInput = document.getElementById('taskDueDate');
+    if (dueDateInput.value) {
+        const date = new Date(dueDateInput.value);
+        const formatted = date.toLocaleDateString('ro-RO', {
+            day: 'numeric',
+            month: 'short',
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+        datePreview.textContent = formatted;
+        datePreview.classList.add('has-date');
+        datePickerWrapper.classList.add('has-date');
+    } else {
+        datePreview.textContent = '';
+        datePreview.classList.remove('has-date');
+        datePickerWrapper.classList.remove('has-date');
+    }
+}
+
+function clearDatePicker() {
+    const dueDateInput = document.getElementById('taskDueDate');
+    dueDateInput.value = '';
+    updateDatePreview();
+}
+
+// Open native picker on button click
+datePickerBtn.addEventListener('click', () => {
+    const dueDateInput = document.getElementById('taskDueDate');
+    
+    // Set minimum date to now (prevent past dates)
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    const hours = String(now.getHours()).padStart(2, '0');
+    const minutes = String(now.getMinutes()).padStart(2, '0');
+    dueDateInput.min = `${year}-${month}-${day}T${hours}:${minutes}`;
+    
+    dueDateInput.showPicker();
+});
+
+// Update preview when date changes
+document.getElementById('taskDueDate').addEventListener('change', updateDatePreview);
+
+// Clear date
+dateClearBtn.addEventListener('click', clearDatePicker);
+
 taskForm.addEventListener('submit', (e) => {
     e.preventDefault();
     const title = taskInput.value.trim();
@@ -615,7 +670,7 @@ taskForm.addEventListener('submit', (e) => {
     
     addTask(title, dueDate);
     taskInput.value = '';
-    dueDateInput.value = '';
+    clearDatePicker();
     taskInput.focus();
 });
 

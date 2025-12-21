@@ -132,7 +132,7 @@ pub fn initSchema(allocator: std.mem.Allocator) !void {
         \\DEFINE FIELD title ON tasks TYPE string;
         \\DEFINE FIELD completed ON tasks TYPE bool DEFAULT false;
         \\DEFINE FIELD created_at ON tasks TYPE datetime DEFAULT time::now();
-        \\DEFINE FIELD due_date ON tasks TYPE option<datetime>;
+        \\DEFINE FIELD due_date ON tasks TYPE option<datetime> ASSERT $value == NONE OR $value >= created_at;
     ;
 
     const tasks_result = try query(allocator, tasks_schema);
@@ -236,9 +236,27 @@ pub fn createTask(allocator: std.mem.Allocator, user_id: []const u8, title: []co
 }
 
 pub fn createTaskWithDueDate(allocator: std.mem.Allocator, user_id: []const u8, title: []const u8, due_date: []const u8) ![]u8 {
+    // Ensure due_date has proper format (add :00Z if needed for SurrealDB)
+    // HTML datetime-local gives "2025-12-25T12:00" but SurrealDB needs "2025-12-25T12:00:00Z"
+    var formatted_date: []const u8 = due_date;
+    var needs_free = false;
+    
+    if (!std.mem.endsWith(u8, due_date, "Z")) {
+        if (std.mem.count(u8, due_date, ":") == 1) {
+            // Format is "2025-12-25T12:00" - add ":00Z"
+            formatted_date = try std.fmt.allocPrint(allocator, "{s}:00Z", .{due_date});
+            needs_free = true;
+        } else {
+            // Format might be "2025-12-25T12:00:00" - just add "Z"
+            formatted_date = try std.fmt.allocPrint(allocator, "{s}Z", .{due_date});
+            needs_free = true;
+        }
+    }
+    defer if (needs_free) allocator.free(formatted_date);
+    
     const sql = try std.fmt.allocPrint(allocator,
         \\CREATE tasks SET user_id = "{s}", title = "{s}", completed = false, created_at = time::now(), due_date = <datetime>"{s}";
-    , .{ user_id, title, due_date });
+    , .{ user_id, title, formatted_date });
     defer allocator.free(sql);
 
     return try query(allocator, sql);
