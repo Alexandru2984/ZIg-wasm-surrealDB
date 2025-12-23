@@ -3,8 +3,8 @@
 // SECURITY: All user inputs MUST be escaped using escape() before SQL interpolation
 
 const std = @import("std");
-const config = @import("config.zig");
-const validation = @import("validation.zig");
+const config = @import("../config/config.zig");
+const validation = @import("../util/validation.zig");
 
 // SECURITY: Escape string for safe SQL interpolation
 // Uses validation.sanitizeForSurrealQL to prevent SQL injection

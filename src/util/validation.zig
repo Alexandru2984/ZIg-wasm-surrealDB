@@ -20,10 +20,11 @@ pub fn validateEmail(email: []const u8) bool {
     // @ can't be first or last
     if (at_pos == 0 or at_pos == email.len - 1) return false;
     
-    // Must have a dot after @
+    // Must have a dot after @ (but not immediately after)
     const domain = email[at_pos + 1 ..];
-    const has_dot = std.mem.indexOf(u8, domain, ".") != null;
-    if (!has_dot) return false;
+    const dot_pos = std.mem.indexOf(u8, domain, ".") orelse return false;
+    if (dot_pos == 0) return false; // Can't be test@.com
+    if (dot_pos == domain.len - 1) return false; // Can't end with dot
     
     // No spaces allowed
     if (std.mem.indexOf(u8, email, " ") != null) return false;

@@ -1,11 +1,13 @@
 const std = @import("std");
 const zap = @import("zap");
-const auth = @import("auth.zig");
-const email = @import("email.zig");
-const db = @import("db.zig");
-const validation = @import("validation.zig");
-const json_helper = @import("json.zig");
-const config = @import("config.zig");
+const app = @import("app.zig");
+const auth = @import("services/auth.zig");
+const email = @import("services/email.zig");
+const db = @import("db/db.zig");
+const validation = @import("util/validation.zig");
+const json_helper = @import("util/json.zig");
+const config = @import("config/config.zig");
+const log = @import("util/log.zig");
 
 // user profile with verification
 const User = struct {
@@ -28,20 +30,19 @@ const Task = struct {
     user_id: []const u8,  // String ID for SurrealDB
 };
 
-// global allocator
+// Global allocator (will use GPA from app module)
 var allocator: std.mem.Allocator = undefined;
 
 pub fn main() !void {
-    allocator = std.heap.page_allocator;
-
-    // Load app configuration from .env
-    config.load(allocator) catch |err| {
-        std.debug.print("⚠️ Could not load .env config: {} (using defaults)\n", .{err});
-    };
+    // Initialize app with GPA allocator
+    try app.init();
+    defer app.deinit(); // Clean shutdown with leak detection
+    
+    allocator = app.allocator();
 
     // Initialize SurrealDB schema
     db.initSchema(allocator) catch |err| {
-        std.debug.print("⚠️ Could not initialize DB schema: {} (continuing anyway)\n", .{err});
+        log.warn("Could not initialize DB schema: {} (continuing anyway)", .{err});
     };
 
     var listener = zap.HttpListener.init(.{
@@ -52,7 +53,7 @@ pub fn main() !void {
     });
     try listener.listen();
 
-    std.debug.print("\n🦎 Task Manager with Auth running at http://127.0.0.1:9000\n\n", .{});
+    log.banner("Task Manager", 9000);
 
     zap.start(.{
         .threads = 2,
@@ -92,6 +93,12 @@ fn handleApi(r: zap.Request, path: []const u8) !void {
             r.sendBody("") catch {};
             return;
         }
+    }
+
+    // Health check endpoint (no auth)
+    if (std.mem.eql(u8, path, "/api/health")) {
+        try handleHealth(r);
+        return;
     }
 
     // Auth routes (no auth required)
@@ -171,6 +178,35 @@ fn getCurrentUserId(r: zap.Request) ?[]const u8 {
     // Validate session token in database
     const user_id = db.validateSession(allocator, token) catch return null;
     return user_id;
+}
+
+// Health check endpoint for monitoring
+fn handleHealth(r: zap.Request) !void {
+    // Simple health check - if we get here, app is running
+    // Check DB connectivity by doing a simple query
+    const db_ok = blk: {
+        const result = db.query(allocator, "SELECT 1;") catch break :blk false;
+        defer allocator.free(result);
+        break :blk true;
+    };
+    
+    const status = if (db_ok) "healthy" else "degraded";
+    const db_status = if (db_ok) "connected" else "disconnected";
+    
+    var response_buf: [256]u8 = undefined;
+    const response = std.fmt.bufPrint(&response_buf, 
+        \\{{"status":"{s}","database":"{s}","config_loaded":{s}}}
+    , .{ status, db_status, if (app.isConfigLoaded()) "true" else "false" }) catch {
+        try r.sendBody("{\"status\":\"error\"}");
+        return;
+    };
+    
+    if (db_ok) {
+        r.setStatus(.ok);
+    } else {
+        r.setStatus(.service_unavailable);
+    }
+    try r.sendBody(response);
 }
 
 fn handleSignup(r: zap.Request) !void {

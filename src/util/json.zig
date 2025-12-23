@@ -137,3 +137,42 @@ test "getString missing field" {
     const result = getString(allocator, "{\"name\":\"Test\"}", "email");
     try std.testing.expect(result == null);
 }
+
+test "getString with escaped quotes" {
+    const allocator = std.testing.allocator;
+    const result = getString(allocator, "{\"msg\":\"He said \\\"hello\\\"\"}", "msg");
+    defer if (result) |r| allocator.free(r);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("He said \"hello\"", result.?);
+}
+
+test "getBool true" {
+    const allocator = std.testing.allocator;
+    const result = getBool(allocator, "{\"active\":true}", "active");
+    try std.testing.expect(result != null);
+    try std.testing.expect(result.? == true);
+}
+
+test "getBool false" {
+    const allocator = std.testing.allocator;
+    const result = getBool(allocator, "{\"active\":false}", "active");
+    try std.testing.expect(result != null);
+    try std.testing.expect(result.? == false);
+}
+
+test "parseRequestBody nested result array" {
+    const allocator = std.testing.allocator;
+    // SurrealDB-style response format
+    const json = "{\"result\":[{\"id\":\"users:123\",\"name\":\"Alex\"}]}";
+    const id = parseRequestBody(allocator, json, "id");
+    defer if (id) |r| allocator.free(r);
+    try std.testing.expect(id != null);
+    try std.testing.expectEqualStrings("users:123", id.?);
+}
+
+test "invalid JSON returns null" {
+    const allocator = std.testing.allocator;
+    const result = getString(allocator, "not valid json", "field");
+    try std.testing.expect(result == null);
+}
+

@@ -1,9 +1,13 @@
 // Email module for Task Manager - Native Zig HTTP Implementation
 // Uses std.http.Client to send emails via Brevo HTTP API
-// No external dependencies (curl not needed)
+// RESILIENCE: Includes retry with exponential backoff
 
 const std = @import("std");
-const config = @import("config.zig");
+const config = @import("../config/config.zig");
+
+// Retry configuration
+const MAX_RETRIES: u8 = 3;
+const RETRY_DELAYS_MS = [_]u64{ 1000, 2000, 5000 }; // 1s, 2s, 5s backoff
 
 // API config struct
 const EmailConfig = struct {
@@ -31,6 +35,61 @@ fn getEmailConfig() !EmailConfig {
         .from_email = from_email,
         .from_name = config.getOrDefault("FROM_NAME", "Zig Task Manager"),
     };
+}
+
+/// Send HTTP request with retry and exponential backoff
+/// Returns true on success (2xx status), false on failure after all retries
+fn sendEmailRequest(allocator: std.mem.Allocator, json_payload: []const u8, api_key: []const u8) !void {
+    var last_error: ?anyerror = null;
+    
+    var attempt: u8 = 0;
+    while (attempt < MAX_RETRIES) : (attempt += 1) {
+        // Create fresh client for each attempt
+        var client = std.http.Client{ .allocator = allocator };
+        defer client.deinit();
+        
+        const result = client.fetch(.{
+            .location = .{ .url = "https://api.brevo.com/v3/smtp/email" },
+            .method = .POST,
+            .payload = json_payload,
+            .extra_headers = &[_]std.http.Header{
+                .{ .name = "api-key", .value = api_key },
+                .{ .name = "accept", .value = "application/json" },
+                .{ .name = "content-type", .value = "application/json" },
+            },
+        }) catch |err| {
+            last_error = err;
+            std.debug.print("⚠️ Email attempt {d}/{d} failed: {}\n", .{ attempt + 1, MAX_RETRIES, err });
+            
+            if (attempt < MAX_RETRIES - 1) {
+                const delay = RETRY_DELAYS_MS[attempt];
+                std.debug.print("   Retrying in {d}ms...\n", .{delay});
+                std.Thread.sleep(delay * std.time.ns_per_ms);
+            }
+            continue;
+        };
+        
+        // Check status
+        switch (result.status) {
+            .ok, .created, .accepted => {
+                return; // Success!
+            },
+            else => {
+                std.debug.print("⚠️ Email attempt {d}/{d}: HTTP {d}\n", .{ attempt + 1, MAX_RETRIES, @intFromEnum(result.status) });
+                last_error = error.EmailSendFailed;
+                
+                if (attempt < MAX_RETRIES - 1) {
+                    const delay = RETRY_DELAYS_MS[attempt];
+                    std.debug.print("   Retrying in {d}ms...\n", .{delay});
+                    std.Thread.sleep(delay * std.time.ns_per_ms);
+                }
+            },
+        }
+    }
+    
+    // All retries exhausted
+    std.debug.print("❌ Email failed after {d} attempts\n", .{MAX_RETRIES});
+    return last_error orelse error.EmailSendFailed;
 }
 
 
@@ -162,35 +221,9 @@ fn sendEmail(allocator: std.mem.Allocator, to_email: []const u8, to_name: []cons
     , .{ email_cfg.from_name, email_cfg.from_email, to_email, to_name_str, subject, escaped_buf[0..escaped_len] });
     defer allocator.free(json_payload);
 
-    // Use std.http.Client with fetch API
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-
-    // Make request using fetch
-    const result = client.fetch(.{
-        .location = .{ .url = "https://api.brevo.com/v3/smtp/email" },
-        .method = .POST,
-        .payload = json_payload,
-        .extra_headers = &[_]std.http.Header{
-            .{ .name = "api-key", .value = email_cfg.api_key },
-            .{ .name = "accept", .value = "application/json" },
-            .{ .name = "content-type", .value = "application/json" },
-        },
-    }) catch |err| {
-        std.debug.print("❌ HTTP request failed: {}\n", .{err});
-        return error.EmailSendFailed;
-    };
-
-    // Check status
-    switch (result.status) {
-        .ok, .created, .accepted => {
-            std.debug.print("✅ Email sent successfully to: {s}\n", .{to_email});
-        },
-        else => {
-            std.debug.print("❌ Brevo API error: HTTP {d}\n", .{@intFromEnum(result.status)});
-            return error.EmailSendFailed;
-        },
-    }
+    // Use retry-enabled request
+    try sendEmailRequest(allocator, json_payload, email_cfg.api_key);
+    std.debug.print("✅ Email sent successfully to: {s}\n", .{to_email});
 }
 
 fn sendHtmlEmail(allocator: std.mem.Allocator, to_email: []const u8, to_name: []const u8, subject: []const u8, html_content: []const u8) !void {
@@ -240,33 +273,7 @@ fn sendHtmlEmail(allocator: std.mem.Allocator, to_email: []const u8, to_name: []
     , .{ email_cfg.from_name, email_cfg.from_email, to_email, to_name_str, subject, escaped_buf[0..escaped_len] });
     defer allocator.free(json_payload);
 
-    // Use std.http.Client with fetch API
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-
-    // Make request using fetch
-    const result = client.fetch(.{
-        .location = .{ .url = "https://api.brevo.com/v3/smtp/email" },
-        .method = .POST,
-        .payload = json_payload,
-        .extra_headers = &[_]std.http.Header{
-            .{ .name = "api-key", .value = email_cfg.api_key },
-            .{ .name = "accept", .value = "application/json" },
-            .{ .name = "content-type", .value = "application/json" },
-        },
-    }) catch |err| {
-        std.debug.print("❌ HTTP request failed: {}\n", .{err});
-        return error.EmailSendFailed;
-    };
-
-    // Check status
-    switch (result.status) {
-        .ok, .created, .accepted => {
-            std.debug.print("✅ HTML Email sent successfully to: {s}\n", .{to_email});
-        },
-        else => {
-            std.debug.print("❌ Brevo API error: HTTP {d}\n", .{@intFromEnum(result.status)});
-            return error.EmailSendFailed;
-        },
-    }
+    // Use retry-enabled request
+    try sendEmailRequest(allocator, json_payload, email_cfg.api_key);
+    std.debug.print("✅ HTML Email sent successfully to: {s}\n", .{to_email});
 }
