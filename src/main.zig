@@ -8,6 +8,7 @@ const validation = @import("util/validation.zig");
 const json_helper = @import("util/json.zig");
 const config = @import("config/config.zig");
 const log = @import("util/log.zig");
+const rate_limiter = @import("util/rate_limiter.zig");
 
 // user profile with verification
 const User = struct {
@@ -32,6 +33,7 @@ const Task = struct {
 
 // Global allocator (will use GPA from app module)
 var allocator: std.mem.Allocator = undefined;
+var app_start_time: i64 = 0;
 
 pub fn main() !void {
     // Initialize app with GPA allocator
@@ -39,11 +41,16 @@ pub fn main() !void {
     defer app.deinit(); // Clean shutdown with leak detection
     
     allocator = app.allocator();
+    app_start_time = std.time.timestamp();
 
     // Initialize SurrealDB schema
     db.initSchema(allocator) catch |err| {
         log.warn("Could not initialize DB schema: {} (continuing anyway)", .{err});
     };
+    
+    // Initialize rate limiters
+    rate_limiter.initAll(allocator);
+    defer rate_limiter.deinitAll();
 
     var listener = zap.HttpListener.init(.{
         .port = 9000,
@@ -62,16 +69,32 @@ pub fn main() !void {
 }
 
 fn handleRequest(r: zap.Request) anyerror!void {
+    // Create request-scoped arena - automatically cleaned up at end of request
+    var arena = app.createRequestArena();
+    defer arena.deinit();
+    const req_alloc = arena.allocator();
+    
+    // Generate unique request ID for tracing
+    var request_id_buf: [16]u8 = undefined;
+    std.crypto.random.bytes(&request_id_buf);
+    const hex_chars = "0123456789abcdef";
+    var request_id: [32]u8 = undefined;
+    for (request_id_buf, 0..) |byte, i| {
+        request_id[i * 2] = hex_chars[byte >> 4];
+        request_id[i * 2 + 1] = hex_chars[byte & 0x0F];
+    }
+    r.setHeader("X-Request-ID", &request_id) catch {};
+    
     const path = r.path orelse "/";
 
     if (std.mem.startsWith(u8, path, "/api/")) {
-        try handleApi(r, path);
+        try handleApi(r, path, req_alloc);
     } else {
-        try serveStatic(r, path);
+        try serveStatic(r, path, req_alloc);
     }
 }
 
-fn handleApi(r: zap.Request, path: []const u8) !void {
+fn handleApi(r: zap.Request, path: []const u8, req_alloc: std.mem.Allocator) !void {
     r.setHeader("Content-Type", "application/json") catch {};
     
     // SECURITY: CORS origin from .env config (defaults to * for development)
@@ -95,30 +118,42 @@ fn handleApi(r: zap.Request, path: []const u8) !void {
         }
     }
 
-    // Health check endpoint (no auth)
+    // Health check endpoint - always 200 if process is up (no auth)
     if (std.mem.eql(u8, path, "/api/health")) {
-        try handleHealth(r);
+        try handleHealth(r, req_alloc);
+        return;
+    }
+    
+    // Ready check endpoint - verifies DB connection (no auth)
+    if (std.mem.eql(u8, path, "/api/ready")) {
+        try handleReady(r, req_alloc);
+        return;
+    }
+    
+    // Metrics endpoint for observability (no auth)
+    if (std.mem.eql(u8, path, "/api/metrics")) {
+        try handleMetrics(r, req_alloc);
         return;
     }
 
     // Auth routes (no auth required)
     if (std.mem.eql(u8, path, "/api/auth/signup")) {
-        try handleSignup(r);
+        try handleSignup(r, req_alloc);
         return;
     } else if (std.mem.eql(u8, path, "/api/auth/login")) {
-        try handleLogin(r);
+        try handleLogin(r, req_alloc);
         return;
     } else if (std.mem.eql(u8, path, "/api/auth/me")) {
-        try handleMe(r);
+        try handleMe(r, req_alloc);
         return;
     } else if (std.mem.eql(u8, path, "/api/auth/forgot-password")) {
-        try handleForgotPassword(r);
+        try handleForgotPassword(r, req_alloc);
         return;
     } else if (std.mem.eql(u8, path, "/api/auth/reset-password")) {
-        try handleResetPassword(r);
+        try handleResetPassword(r, req_alloc);
         return;
     } else if (std.mem.startsWith(u8, path, "/api/auth/verify")) {
-        try handleVerifyEmail(r);
+        try handleVerifyEmail(r, req_alloc);
         return;
     }
 
@@ -126,14 +161,14 @@ fn handleApi(r: zap.Request, path: []const u8) !void {
     if (std.mem.eql(u8, path, "/api/profile")) {
         if (r.method) |method| {
             if (std.mem.eql(u8, method, "GET")) {
-                try getProfile(r);
+                try getProfile(r, req_alloc);
             } else if (std.mem.eql(u8, method, "PUT")) {
-                try updateProfile(r);
+                try updateProfile(r, req_alloc);
             }
         }
         return;
     } else if (std.mem.eql(u8, path, "/api/profile/password")) {
-        try changePassword(r);
+        try changePassword(r, req_alloc);
         return;
     }
 
@@ -141,9 +176,9 @@ fn handleApi(r: zap.Request, path: []const u8) !void {
     if (std.mem.eql(u8, path, "/api/tasks")) {
         if (r.method) |method| {
             if (std.mem.eql(u8, method, "GET")) {
-                try getTasks(r);
+                try getTasks(r, req_alloc);
             } else if (std.mem.eql(u8, method, "POST")) {
-                try createTask(r);
+                try createTask(r, req_alloc);
             }
         }
     } else if (std.mem.startsWith(u8, path, "/api/tasks/")) {
@@ -156,9 +191,9 @@ fn handleApi(r: zap.Request, path: []const u8) !void {
 
         if (r.method) |method| {
             if (std.mem.eql(u8, method, "PUT")) {
-                try toggleTask(r, task_id);
+                try toggleTask(r, task_id, req_alloc);
             } else if (std.mem.eql(u8, method, "DELETE")) {
-                try deleteTask(r, task_id);
+                try deleteTask(r, task_id, req_alloc);
             }
         }
     } else {
@@ -180,28 +215,52 @@ fn getCurrentUserId(r: zap.Request) ?[]const u8 {
     return user_id;
 }
 
-// Health check endpoint for monitoring
-fn handleHealth(r: zap.Request) !void {
-    // Simple health check - if we get here, app is running
-    // Check DB connectivity by doing a simple query
+// Get client IP for rate limiting (supports X-Real-IP from Nginx)
+fn getClientIp(r: zap.Request) []const u8 {
+    // Check for Nginx forwarded IP first
+    if (r.getHeader("x-real-ip")) |ip| return ip;
+    if (r.getHeader("x-forwarded-for")) |forwarded| {
+        // X-Forwarded-For can have multiple IPs, take the first one
+        if (std.mem.indexOf(u8, forwarded, ",")) |comma| {
+            return forwarded[0..comma];
+        }
+        return forwarded;
+    }
+    // Fallback to default (connection IP would need raw socket access)
+    return "127.0.0.1";
+}
+
+// Health check endpoint - always 200 if process is up
+fn handleHealth(r: zap.Request, req_alloc: std.mem.Allocator) !void {
+    _ = req_alloc;
+    r.setStatus(.ok);
+    try r.sendBody("{\"status\":\"healthy\"}");
+}
+
+// Ready check endpoint - verifies DB connection and config
+fn handleReady(r: zap.Request, req_alloc: std.mem.Allocator) !void {
+    // Check DB connectivity
     const db_ok = blk: {
-        const result = db.query(allocator, "INFO FOR DB;") catch break :blk false;
-        defer allocator.free(result);
+        _ = db.query(req_alloc, "INFO FOR DB;") catch break :blk false;
         break :blk true;
     };
     
-    const status = if (db_ok) "healthy" else "degraded";
+    // Check config
+    const config_ok = app.isConfigLoaded();
+    
+    const ready = db_ok and config_ok;
+    const status = if (ready) "ready" else "not_ready";
     const db_status = if (db_ok) "connected" else "disconnected";
     
     var response_buf: [256]u8 = undefined;
     const response = std.fmt.bufPrint(&response_buf, 
         \\{{"status":"{s}","database":"{s}","config_loaded":{s}}}
-    , .{ status, db_status, if (app.isConfigLoaded()) "true" else "false" }) catch {
+    , .{ status, db_status, if (config_ok) "true" else "false" }) catch {
         try r.sendBody("{\"status\":\"error\"}");
         return;
     };
     
-    if (db_ok) {
+    if (ready) {
         r.setStatus(.ok);
     } else {
         r.setStatus(.service_unavailable);
@@ -209,7 +268,45 @@ fn handleHealth(r: zap.Request) !void {
     try r.sendBody(response);
 }
 
-fn handleSignup(r: zap.Request) !void {
+// Metrics endpoint for observability (Prometheus-compatible format)
+fn handleMetrics(r: zap.Request, req_alloc: std.mem.Allocator) !void {
+    _ = req_alloc;
+    
+    // Basic metrics - in production, these would track actual counters
+    const uptime = std.time.timestamp() - app_start_time;
+    
+    var metrics_buf: [1024]u8 = undefined;
+    const metrics = std.fmt.bufPrint(&metrics_buf,
+        \\# HELP app_uptime_seconds Application uptime in seconds
+        \\# TYPE app_uptime_seconds counter
+        \\app_uptime_seconds {d}
+        \\
+        \\# HELP app_info Application info
+        \\# TYPE app_info gauge
+        \\app_info{{version="1.0.0"}} 1
+        \\
+    , .{uptime}) catch {
+        try r.sendBody("# Error generating metrics");
+        return;
+    };
+    
+    r.setHeader("Content-Type", "text/plain; version=0.0.4") catch {};
+    r.setStatus(.ok);
+    try r.sendBody(metrics);
+}
+
+fn handleSignup(r: zap.Request, req_alloc: std.mem.Allocator) !void {
+    // SECURITY: Rate limiting - 3 signups per minute per IP
+    const client_ip = getClientIp(r);
+    if (rate_limiter.signup_limiter) |*limiter| {
+        if (!limiter.isAllowed(client_ip)) {
+            r.setStatus(.too_many_requests);
+            r.setHeader("Retry-After", "60") catch {};
+            try r.sendBody("{\"error\": \"Too many signup attempts. Please wait 1 minute.\"}");
+            return;
+        }
+    }
+    
     const body = r.body orelse {
         r.setStatus(.bad_request);
         try r.sendBody("{\"error\": \"No body\"}");
@@ -217,7 +314,7 @@ fn handleSignup(r: zap.Request) !void {
     };
 
     // Parse email
-    const user_email = parseJsonField(body, "email") orelse {
+    const user_email = parseJsonField(req_alloc, body, "email") orelse {
         r.setStatus(.bad_request);
         try r.sendBody("{\"error\": \"Missing email\"}");
         return;
@@ -231,7 +328,7 @@ fn handleSignup(r: zap.Request) !void {
     }
 
     // Parse password
-    const password = parseJsonField(body, "password") orelse {
+    const password = parseJsonField(req_alloc, body, "password") orelse {
         r.setStatus(.bad_request);
         try r.sendBody("{\"error\": \"Missing password\"}");
         return;
@@ -250,7 +347,7 @@ fn handleSignup(r: zap.Request) !void {
     }
 
     // Parse name
-    const name = parseJsonField(body, "name") orelse "User";
+    const name = parseJsonField(req_alloc, body, "name") orelse "User";
     
     // SECURITY: Validate name
     if (!validation.validateName(name)) {
@@ -260,8 +357,7 @@ fn handleSignup(r: zap.Request) !void {
     }
 
     // Check if email exists in SurrealDB
-    if (db.getUserByEmail(allocator, user_email)) |result| {
-        defer allocator.free(result);
+    if (db.getUserByEmail(req_alloc, user_email)) |result| {
         if (std.mem.indexOf(u8, result, "email")) |_| {
             r.setStatus(.bad_request);
             try r.sendBody("{\"error\": \"Email already exists\"}");
@@ -270,36 +366,35 @@ fn handleSignup(r: zap.Request) !void {
     } else |_| {}
 
     // Hash password
-    const password_hash = try auth.hashPassword(allocator, password);
+    const password_hash = try auth.hashPassword(req_alloc, password);
 
     // Generate verification code (6 digits)
     // SECURITY: Code is sent via email only, never logged
-    const verification_code = try auth.generateVerificationCode(allocator);
+    const verification_code = try auth.generateVerificationCode(req_alloc);
 
-    // Create user in SurrealDB
-    const db_result = db.createUser(allocator, user_email, password_hash, name, verification_code) catch {
+    // Create user in SurrealDB with 10-minute verification code expiration
+    const verification_expires = std.time.timestamp() + 600; // 10 minutes
+    const db_result = db.createUser(req_alloc, user_email, password_hash, name, verification_code, verification_expires) catch {
         r.setStatus(.internal_server_error);
         try r.sendBody("{\"error\": \"Failed to create user\"}");
         return;
     };
-    defer allocator.free(db_result);
     
     // Extract user ID from DB result
-    const user_id = parseJsonField(db_result, "id") orelse "unknown";
+    const user_id = parseJsonField(req_alloc, db_result, "id") orelse "unknown";
     std.debug.print("✅ User created in DB: {s}\n", .{user_id});
 
     // Send confirmation email
-    email.sendConfirmationEmail(allocator, user_email, name, verification_code) catch |err| {
+    email.sendConfirmationEmail(req_alloc, user_email, name, verification_code) catch |err| {
         std.debug.print("Failed to send confirmation email: {}\n", .{err});
     };
 
     // Create secure session token (stored in DB)
-    const token = db.createSession(allocator, user_id) catch {
+    const token = db.createSession(req_alloc, user_id) catch {
         r.setStatus(.internal_server_error);
         try r.sendBody("{\"error\": \"Failed to create session\"}");
         return;
     };
-    defer allocator.free(token);
 
     var response: [512]u8 = undefined;
     const len = (std.fmt.bufPrint(&response, "{{\"token\":\"{s}\",\"user\":{{\"id\":\"{s}\",\"email\":\"{s}\",\"name\":\"{s}\",\"email_verified\":false}}}}", .{
@@ -313,47 +408,56 @@ fn handleSignup(r: zap.Request) !void {
     try r.sendBody(response[0..len]);
 }
 
-fn handleLogin(r: zap.Request) !void {
+fn handleLogin(r: zap.Request, req_alloc: std.mem.Allocator) !void {
+    // SECURITY: Rate limiting - 5 attempts per minute per IP
+    const client_ip = getClientIp(r);
+    if (rate_limiter.login_limiter) |*limiter| {
+        if (!limiter.isAllowed(client_ip)) {
+            r.setStatus(.too_many_requests);
+            r.setHeader("Retry-After", "60") catch {};
+            try r.sendBody("{\"error\": \"Too many login attempts. Please wait 1 minute.\"}");
+            return;
+        }
+    }
+    
     const body = r.body orelse {
         r.setStatus(.bad_request);
         try r.sendBody("{\"error\": \"No body\"}");
         return;
     };
 
-    const login_email = parseJsonField(body, "email") orelse {
+    const login_email = parseJsonField(req_alloc, body, "email") orelse {
         r.setStatus(.bad_request);
         try r.sendBody("{\"error\": \"Missing email\"}");
         return;
     };
 
-    const password = parseJsonField(body, "password") orelse {
+    const password = parseJsonField(req_alloc, body, "password") orelse {
         r.setStatus(.bad_request);
         try r.sendBody("{\"error\": \"Missing password\"}");
         return;
     };
 
     // Query SurrealDB for user
-    const db_result = db.getUserByEmail(allocator, login_email) catch {
+    const db_result = db.getUserByEmail(req_alloc, login_email) catch {
         r.setStatus(.internal_server_error);
         try r.sendBody("{\"error\": \"Database error\"}");
         return;
     };
-    defer allocator.free(db_result);
     
     // Check if user exists and verify password
-    if (parseJsonField(db_result, "password_hash")) |stored_hash| {
-        const valid = auth.verifyPassword(allocator, stored_hash, password) catch false;
+    if (parseJsonField(req_alloc, db_result, "password_hash")) |stored_hash| {
+        const valid = auth.verifyPassword(req_alloc, stored_hash, password) catch false;
         if (valid) {
-            const user_id = parseJsonField(db_result, "id") orelse "unknown";
-            const user_name = parseJsonField(db_result, "name") orelse "User";
+            const user_id = parseJsonField(req_alloc, db_result, "id") orelse "unknown";
+            const user_name = parseJsonField(req_alloc, db_result, "name") orelse "User";
             
             // Create secure session token (stored in DB)
-            const token = db.createSession(allocator, user_id) catch {
+            const token = db.createSession(req_alloc, user_id) catch {
                 r.setStatus(.internal_server_error);
                 try r.sendBody("{\"error\": \"Failed to create session\"}");
                 return;
             };
-            defer allocator.free(token);
             
             var response: [512]u8 = undefined;
             const len = (std.fmt.bufPrint(&response, "{{\"token\":\"{s}\",\"user\":{{\"id\":\"{s}\",\"email\":\"{s}\",\"name\":\"{s}\"}}}}", .{
@@ -373,24 +477,22 @@ fn handleLogin(r: zap.Request) !void {
     try r.sendBody("{\"error\": \"Invalid credentials\"}");
 }
 
-fn handleMe(r: zap.Request) !void {
+fn handleMe(r: zap.Request, req_alloc: std.mem.Allocator) !void {
     const user_id = getCurrentUserId(r) orelse {
         r.setStatus(.unauthorized);
         try r.sendBody("{\"error\": \"Not authenticated\"}");
         return;
     };
-    defer allocator.free(user_id); // SECURITY: Free owned memory from validateSession
 
     // Query user from DB
-    const db_result = db.getUserById(allocator, user_id) catch {
+    const db_result = db.getUserById(req_alloc, user_id) catch {
         r.setStatus(.internal_server_error);
         try r.sendBody("{\"error\": \"Database error\"}");
         return;
     };
-    defer allocator.free(db_result);
     
-    const user_email = parseJsonField(db_result, "email") orelse "unknown";
-    const user_name = parseJsonField(db_result, "name") orelse "User";
+    const user_email = parseJsonField(req_alloc, db_result, "email") orelse "unknown";
+    const user_name = parseJsonField(req_alloc, db_result, "name") orelse "User";
     const email_verified = std.mem.indexOf(u8, db_result, "\"email_verified\":true") != null;
 
     var response: [512]u8 = undefined;
@@ -405,31 +507,29 @@ fn handleMe(r: zap.Request) !void {
     try r.sendBody(response[0..len]);
 }
 
-fn getTasks(r: zap.Request) !void {
+fn getTasks(r: zap.Request, req_alloc: std.mem.Allocator) !void {
     const user_id = getCurrentUserId(r) orelse {
         r.setStatus(.ok);
         try r.sendBody("[]");
         return;
     };
-    defer allocator.free(user_id); // SECURITY: Free owned memory
 
     // Query tasks from SurrealDB
-    const db_result = db.getTasksByUser(allocator, user_id) catch {
+    const db_result = db.getTasksByUser(req_alloc, user_id) catch {
         r.setStatus(.ok);
         try r.sendBody("[]");
         return;
     };
-    defer allocator.free(db_result);
     
     // Extract result array from DB response
     if (std.mem.indexOf(u8, db_result, "\"result\":[")) |start| {
         const result_start = start + 10;
         if (std.mem.indexOf(u8, db_result[result_start..], "]")) |end| {
             var json = std.ArrayListUnmanaged(u8){};
-            defer json.deinit(allocator);
-            try json.appendSlice(allocator, "[");
-            try json.appendSlice(allocator, db_result[result_start..result_start + end]);
-            try json.appendSlice(allocator, "]");
+            defer json.deinit(req_alloc);
+            try json.appendSlice(req_alloc, "[");
+            try json.appendSlice(req_alloc, db_result[result_start..result_start + end]);
+            try json.appendSlice(req_alloc, "]");
             r.setStatus(.ok);
             try r.sendBody(json.items);
             return;
@@ -440,13 +540,12 @@ fn getTasks(r: zap.Request) !void {
     try r.sendBody("[]");
 }
 
-fn createTask(r: zap.Request) !void {
+fn createTask(r: zap.Request, req_alloc: std.mem.Allocator) !void {
     const user_id = getCurrentUserId(r) orelse {
         r.setStatus(.unauthorized);
         try r.sendBody("{\"error\": \"Login required\", \"useLocal\": true}");
         return;
     };
-    defer allocator.free(user_id); // SECURITY: Free owned memory
 
     const body = r.body orelse {
         r.setStatus(.bad_request);
@@ -454,32 +553,31 @@ fn createTask(r: zap.Request) !void {
         return;
     };
 
-    const title = parseJsonField(body, "title") orelse {
+    const title = parseJsonField(req_alloc, body, "title") orelse {
         r.setStatus(.bad_request);
         try r.sendBody("{\"error\": \"Missing title\"}");
         return;
     };
 
     // Check if due_date is provided
-    const due_date = parseJsonField(body, "due_date");
+    const due_date = parseJsonField(req_alloc, body, "due_date");
     
     // Create task in SurrealDB (with or without due_date)
     const db_result = if (due_date) |dd|
-        db.createTaskWithDueDate(allocator, user_id, title, dd) catch {
+        db.createTaskWithDueDate(req_alloc, user_id, title, dd) catch {
             r.setStatus(.internal_server_error);
             try r.sendBody("{\"error\": \"Failed to create task\"}");
             return;
         }
     else
-        db.createTask(allocator, user_id, title) catch {
+        db.createTask(req_alloc, user_id, title) catch {
             r.setStatus(.internal_server_error);
             try r.sendBody("{\"error\": \"Failed to create task\"}");
             return;
         };
-    defer allocator.free(db_result);
     
-    const task_id = parseJsonField(db_result, "id") orelse "unknown";
-    const created_at = parseJsonField(db_result, "created_at") orelse "";
+    const task_id = parseJsonField(req_alloc, db_result, "id") orelse "unknown";
+    const created_at = parseJsonField(req_alloc, db_result, "created_at") orelse "";
     std.debug.print("✅ Task created: {s}\n", .{task_id});
 
     var response: [512]u8 = undefined;
@@ -503,17 +601,16 @@ fn createTask(r: zap.Request) !void {
     }
 }
 
-fn toggleTask(r: zap.Request, task_id: []const u8) !void {
+fn toggleTask(r: zap.Request, task_id: []const u8, req_alloc: std.mem.Allocator) !void {
     // SECURITY: Verify ownership before toggling
     const user_id = getCurrentUserId(r) orelse {
         r.setStatus(.unauthorized);
         try r.sendBody("{\"error\": \"Unauthorized\"}");
         return;
     };
-    defer allocator.free(user_id); // SECURITY: Free owned memory
     
     // Check if this task belongs to the current user
-    const is_owner = db.verifyTaskOwnership(allocator, task_id, user_id) catch {
+    const is_owner = db.verifyTaskOwnership(req_alloc, task_id, user_id) catch {
         r.setStatus(.internal_server_error);
         try r.sendBody("{\"error\": \"Failed to verify ownership\"}");
         return;
@@ -525,15 +622,14 @@ fn toggleTask(r: zap.Request, task_id: []const u8) !void {
         return;
     }
     
-    const db_result = db.toggleTask(allocator, task_id) catch {
+    const db_result = db.toggleTask(req_alloc, task_id) catch {
         r.setStatus(.internal_server_error);
         try r.sendBody("{\"error\": \"Failed to toggle task\"}");
         return;
     };
-    defer allocator.free(db_result);
     
     const completed = std.mem.indexOf(u8, db_result, "\"completed\":true") != null;
-    const title = parseJsonField(db_result, "title") orelse "Task";
+    const title = parseJsonField(req_alloc, db_result, "title") orelse "Task";
     
     var response: [256]u8 = undefined;
     const len = (std.fmt.bufPrint(&response, "{{\"id\":\"{s}\",\"title\":\"{s}\",\"completed\":{}}}", .{
@@ -546,17 +642,16 @@ fn toggleTask(r: zap.Request, task_id: []const u8) !void {
     try r.sendBody(response[0..len]);
 }
 
-fn deleteTask(r: zap.Request, task_id: []const u8) !void {
+fn deleteTask(r: zap.Request, task_id: []const u8, req_alloc: std.mem.Allocator) !void {
     // SECURITY: Verify ownership before deleting
     const user_id = getCurrentUserId(r) orelse {
         r.setStatus(.unauthorized);
         try r.sendBody("{\"error\": \"Unauthorized\"}");
         return;
     };
-    defer allocator.free(user_id); // SECURITY: Free owned memory
     
     // Check if this task belongs to the current user
-    const is_owner = db.verifyTaskOwnership(allocator, task_id, user_id) catch {
+    const is_owner = db.verifyTaskOwnership(req_alloc, task_id, user_id) catch {
         r.setStatus(.internal_server_error);
         try r.sendBody("{\"error\": \"Failed to verify ownership\"}");
         return;
@@ -568,7 +663,7 @@ fn deleteTask(r: zap.Request, task_id: []const u8) !void {
         return;
     }
     
-    _ = db.deleteTask(allocator, task_id) catch {
+    _ = db.deleteTask(req_alloc, task_id) catch {
         r.setStatus(.internal_server_error);
         try r.sendBody("{\"error\": \"Failed to delete task\"}");
         return;
@@ -579,13 +674,13 @@ fn deleteTask(r: zap.Request, task_id: []const u8) !void {
 }
 
 // JSON field parser using proper std.json (handles spaces, escapes, field order)
-// NOTE: Returns owned memory that MUST be freed by caller when result is not null
-fn parseJsonField(body: []const u8, field: []const u8) ?[]const u8 {
+// NOTE: With arena allocator, no need to manually free the returned memory
+fn parseJsonField(alloc: std.mem.Allocator, body: []const u8, field: []const u8) ?[]const u8 {
     // Use proper JSON parsing from json.zig helper
-    return json_helper.parseRequestBody(allocator, body, field);
+    return json_helper.parseRequestBody(alloc, body, field);
 }
 
-fn serveStatic(r: zap.Request, path: []const u8) !void {
+fn serveStatic(r: zap.Request, path: []const u8, req_alloc: std.mem.Allocator) !void {
     // SECURITY: Block path traversal attacks
     if (std.mem.indexOf(u8, path, "..") != null) {
         std.debug.print("🚫 Path traversal blocked: {s}\n", .{path});
@@ -615,19 +710,17 @@ fn serveStatic(r: zap.Request, path: []const u8) !void {
     
     // SECURITY: Verify resolved path stays within public directory
     const cwd = std.fs.cwd();
-    const real_path = cwd.realpathAlloc(allocator, file_path) catch {
+    const real_path = cwd.realpathAlloc(req_alloc, file_path) catch {
         r.setStatus(.not_found);
         try r.sendBody("404 Not Found");
         return;
     };
-    defer allocator.free(real_path);
     
-    const public_base = cwd.realpathAlloc(allocator, "public") catch {
+    const public_base = cwd.realpathAlloc(req_alloc, "public") catch {
         r.setStatus(.internal_server_error);
         try r.sendBody("500 Server Error");
         return;
     };
-    defer allocator.free(public_base);
     
     // Ensure file is within public directory
     if (!std.mem.startsWith(u8, real_path, public_base)) {
@@ -678,9 +771,15 @@ fn serveStatic(r: zap.Request, path: []const u8) !void {
 
     const stat = try file.stat();
     const content = try allocator.alloc(u8, stat.size);
-    defer allocator.free(content);
 
     _ = try file.readAll(content);
+
+    // Cache-Control: no-cache for HTML, 1 hour for assets
+    if (std.mem.eql(u8, ext, ".html")) {
+        r.setHeader("Cache-Control", "no-cache, must-revalidate") catch {};
+    } else {
+        r.setHeader("Cache-Control", "public, max-age=3600") catch {};
+    }
 
     r.setStatus(.ok);
     try r.sendBody(content);
@@ -688,24 +787,22 @@ fn serveStatic(r: zap.Request, path: []const u8) !void {
 
 // ============== PROFILE HANDLERS ==============
 
-fn getProfile(r: zap.Request) !void {
+fn getProfile(r: zap.Request, req_alloc: std.mem.Allocator) !void {
     const user_id = getCurrentUserId(r) orelse {
         r.setStatus(.unauthorized);
         try r.sendBody("{\"error\": \"Not authenticated\"}");
         return;
     };
-    defer allocator.free(user_id); // SECURITY: Free owned memory
 
     // Query user from DB
-    const db_result = db.getUserById(allocator, user_id) catch {
+    const db_result = db.getUserById(req_alloc, user_id) catch {
         r.setStatus(.internal_server_error);
         try r.sendBody("{\"error\": \"Database error\"}");
         return;
     };
-    defer allocator.free(db_result);
     
-    const user_email = parseJsonField(db_result, "email") orelse "unknown";
-    const user_name = parseJsonField(db_result, "name") orelse "User";
+    const user_email = parseJsonField(req_alloc, db_result, "email") orelse "unknown";
+    const user_name = parseJsonField(req_alloc, db_result, "name") orelse "User";
     const email_verified = std.mem.indexOf(u8, db_result, "\"email_verified\":true") != null;
 
     var response: [512]u8 = undefined;
@@ -720,13 +817,12 @@ fn getProfile(r: zap.Request) !void {
     try r.sendBody(response[0..len]);
 }
 
-fn updateProfile(r: zap.Request) !void {
+fn updateProfile(r: zap.Request, req_alloc: std.mem.Allocator) !void {
     const user_id = getCurrentUserId(r) orelse {
         r.setStatus(.unauthorized);
         try r.sendBody("{\"error\": \"Not authenticated\"}");
         return;
     };
-    defer allocator.free(user_id); // SECURITY: Free owned memory
 
     const body = r.body orelse {
         r.setStatus(.bad_request);
@@ -735,22 +831,21 @@ fn updateProfile(r: zap.Request) !void {
     };
 
     // Update name if provided
-    if (parseJsonField(body, "name")) |new_name| {
-        if (db.updateUserName(allocator, user_id, new_name)) |result| {
+    if (parseJsonField(req_alloc, body, "name")) |new_name| {
+        if (db.updateUserName(req_alloc, user_id, new_name)) |result| {
             allocator.free(result);
         } else |_| {}
     }
 
     // Query updated user
-    const db_result = db.getUserById(allocator, user_id) catch {
+    const db_result = db.getUserById(req_alloc, user_id) catch {
         r.setStatus(.ok);
         try r.sendBody("{\"success\": true}");
         return;
     };
-    defer allocator.free(db_result);
     
-    const user_email = parseJsonField(db_result, "email") orelse "unknown";
-    const user_name = parseJsonField(db_result, "name") orelse "User";
+    const user_email = parseJsonField(req_alloc, db_result, "email") orelse "unknown";
+    const user_name = parseJsonField(req_alloc, db_result, "name") orelse "User";
     const email_verified = std.mem.indexOf(u8, db_result, "\"email_verified\":true") != null;
 
     var response: [512]u8 = undefined;
@@ -765,13 +860,12 @@ fn updateProfile(r: zap.Request) !void {
     try r.sendBody(response[0..len]);
 }
 
-fn changePassword(r: zap.Request) !void {
+fn changePassword(r: zap.Request, req_alloc: std.mem.Allocator) !void {
     const user_id = getCurrentUserId(r) orelse {
         r.setStatus(.unauthorized);
         try r.sendBody("{\"error\": \"Not authenticated\"}");
         return;
     };
-    defer allocator.free(user_id); // SECURITY: Free owned memory
 
     const body = r.body orelse {
         r.setStatus(.bad_request);
@@ -779,34 +873,33 @@ fn changePassword(r: zap.Request) !void {
         return;
     };
 
-    const current_password = parseJsonField(body, "current") orelse {
+    const current_password = parseJsonField(req_alloc, body, "current") orelse {
         r.setStatus(.bad_request);
         try r.sendBody("{\"error\": \"Missing current password\"}");
         return;
     };
 
-    const new_password = parseJsonField(body, "new") orelse {
+    const new_password = parseJsonField(req_alloc, body, "new") orelse {
         r.setStatus(.bad_request);
         try r.sendBody("{\"error\": \"Missing new password\"}");
         return;
     };
 
     // Get current user from DB to verify password
-    const db_result = db.getUserById(allocator, user_id) catch {
+    const db_result = db.getUserById(req_alloc, user_id) catch {
         r.setStatus(.internal_server_error);
         try r.sendBody("{\"error\": \"Database error\"}");
         return;
     };
-    defer allocator.free(db_result);
     
-    const stored_hash = parseJsonField(db_result, "password_hash") orelse {
+    const stored_hash = parseJsonField(req_alloc, db_result, "password_hash") orelse {
         r.setStatus(.internal_server_error);
         try r.sendBody("{\"error\": \"Could not verify password\"}");
         return;
     };
 
     // Verify current password
-    const valid = auth.verifyPassword(allocator, stored_hash, current_password) catch false;
+    const valid = auth.verifyPassword(req_alloc, stored_hash, current_password) catch false;
     if (!valid) {
         r.setStatus(.unauthorized);
         try r.sendBody("{\"error\": \"Current password is incorrect\"}");
@@ -814,10 +907,9 @@ fn changePassword(r: zap.Request) !void {
     }
 
     // Update password in DB
-    const new_hash = try auth.hashPassword(allocator, new_password);
-    defer allocator.free(new_hash);
+    const new_hash = try auth.hashPassword(req_alloc, new_password);
     
-    if (db.updateUserPassword(allocator, user_id, new_hash)) |result| {
+    if (db.updateUserPassword(req_alloc, user_id, new_hash)) |result| {
         allocator.free(result);
     } else |_| {
         r.setStatus(.internal_server_error);
@@ -836,7 +928,7 @@ fn getCurrentUserMutable(r: zap.Request) ?[]const u8 {
 
 // ============== EMAIL VERIFICATION ==============
 
-fn handleVerifyEmail(r: zap.Request) !void {
+fn handleVerifyEmail(r: zap.Request, req_alloc: std.mem.Allocator) !void {
     if (r.method) |m| {
         if (!std.mem.eql(u8, m, "POST")) {
             r.setStatus(.method_not_allowed);
@@ -851,25 +943,34 @@ fn handleVerifyEmail(r: zap.Request) !void {
         return;
     };
 
-    const code = parseJsonField(body, "code") orelse {
+    const code = parseJsonField(req_alloc, body, "code") orelse {
         r.setStatus(.bad_request);
         try r.sendBody("{\"error\": \"Missing code\"}");
         return;
     };
 
     // Find user with this verification code in DB
-    const db_result = db.getUserByVerificationToken(allocator, code) catch {
+    const db_result = db.getUserByVerificationToken(req_alloc, code) catch {
         r.setStatus(.bad_request);
         try r.sendBody("{\"error\": \"Invalid code\"}");
         return;
     };
-    defer allocator.free(db_result);
     
     // Check if user found
-    if (parseJsonField(db_result, "id")) |user_id| {
-        // Update user as verified
-        if (db.updateUserVerified(allocator, user_id)) |result| {
-            allocator.free(result);
+    if (parseJsonField(req_alloc, db_result, "id")) |user_id| {
+        // Check if code has expired
+        if (parseJsonField(req_alloc, db_result, "verification_expires")) |expires_str| {
+            const expires = std.fmt.parseInt(i64, expires_str, 10) catch 0;
+            const now = std.time.timestamp();
+            if (now > expires) {
+                r.setStatus(.bad_request);
+                try r.sendBody("{\"error\": \"Verification code has expired. Please request a new one.\"}");
+                return;
+            }
+        }
+        
+        // Update user as verified (arena handles cleanup)
+        if (db.updateUserVerified(req_alloc, user_id)) |_| {
             r.setStatus(.ok);
             try r.sendBody("{\"success\": true, \"message\": \"Email verified!\"}");
             return;
@@ -882,78 +983,89 @@ fn handleVerifyEmail(r: zap.Request) !void {
 
 // ============== PASSWORD RESET ==============
 
-fn handleForgotPassword(r: zap.Request) !void {
+fn handleForgotPassword(r: zap.Request, req_alloc: std.mem.Allocator) !void {
+    // SECURITY: Rate limiting - 3 password reset requests per minute per IP
+    const client_ip = getClientIp(r);
+    if (rate_limiter.forgot_password_limiter) |*limiter| {
+        if (!limiter.isAllowed(client_ip)) {
+            r.setStatus(.too_many_requests);
+            r.setHeader("Retry-After", "60") catch {};
+            try r.sendBody("{\"error\": \"Too many password reset requests. Please wait 1 minute.\"}");
+            return;
+        }
+    }
+    
     const body = r.body orelse {
         r.setStatus(.bad_request);
         try r.sendBody("{\"error\": \"No body\"}");
         return;
     };
 
-    const user_email = parseJsonField(body, "email") orelse {
+    const user_email = parseJsonField(req_alloc, body, "email") orelse {
         r.setStatus(.bad_request);
         try r.sendBody("{\"error\": \"Missing email\"}");
         return;
     };
 
     // Find user in DB
-    if (db.getUserByEmail(allocator, user_email)) |db_result| {
-        defer allocator.free(db_result);
+    if (db.getUserByEmail(req_alloc, user_email)) |db_result| {
         
-        if (parseJsonField(db_result, "id")) |user_id| {
+        if (parseJsonField(req_alloc, db_result, "id")) |user_id| {
             // Generate reset token
-            const reset_token = try auth.createToken(allocator, "reset");
+            const reset_token = try auth.createToken(req_alloc, "reset");
             const expires = std.time.timestamp() + 3600;
             
             // Save token to DB
-            if (db.setResetToken(allocator, user_id, reset_token, expires)) |result| {
-                allocator.free(result);
+            if (db.setResetToken(req_alloc, user_id, reset_token, expires)) |_| {
+                // Arena will clean up - no manual free needed
                 
                 // Send reset email
-                email.sendPasswordResetEmail(allocator, user_email, reset_token) catch |err| {
+                email.sendPasswordResetEmail(req_alloc, user_email, reset_token) catch |err| {
                     std.debug.print("Failed to send reset email: {}\n", .{err});
                 };
-            } else |_| {}
+            } else |_| {
+            }
+        } else {
         }
-    } else |_| {}
+    } else |_| {
+    }
 
     // Always return success to prevent email enumeration
     r.setStatus(.ok);
     try r.sendBody("{\"success\": true, \"message\": \"If email exists, reset link sent\"}");
 }
 
-fn handleResetPassword(r: zap.Request) !void {
+fn handleResetPassword(r: zap.Request, req_alloc: std.mem.Allocator) !void {
     const body = r.body orelse {
         r.setStatus(.bad_request);
         try r.sendBody("{\"error\": \"No body\"}");
         return;
     };
 
-    const token = parseJsonField(body, "token") orelse {
+    const token = parseJsonField(req_alloc, body, "token") orelse {
         r.setStatus(.bad_request);
         try r.sendBody("{\"error\": \"Missing token\"}");
         return;
     };
 
-    const new_password = parseJsonField(body, "password") orelse {
+    const new_password = parseJsonField(req_alloc, body, "password") orelse {
         r.setStatus(.bad_request);
         try r.sendBody("{\"error\": \"Missing password\"}");
         return;
     };
 
     // Find user with this reset token in DB
-    const db_result = db.getUserByResetToken(allocator, token) catch {
+    const db_result = db.getUserByResetToken(req_alloc, token) catch {
         r.setStatus(.bad_request);
         try r.sendBody("{\"error\": \"Invalid token\"}");
         return;
     };
-    defer allocator.free(db_result);
     
-    if (parseJsonField(db_result, "id")) |user_id| {
+    if (parseJsonField(req_alloc, db_result, "id")) |user_id| {
         // Hash new password and update
-        const new_hash = try auth.hashPassword(allocator, new_password);
-        defer allocator.free(new_hash);
+        const new_hash = try auth.hashPassword(req_alloc, new_password);
         
-        if (db.updateUserPassword(allocator, user_id, new_hash)) |result| {
+        if (db.updateUserPassword(req_alloc, user_id, new_hash)) |result| {
             allocator.free(result);
             r.setStatus(.ok);
             try r.sendBody("{\"success\": true}");

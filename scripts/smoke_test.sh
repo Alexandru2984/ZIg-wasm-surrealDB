@@ -10,6 +10,7 @@ FAIL=0
 # Colors
 GREEN='\033[0;32m'
 RED='\033[0;31m'
+YELLOW='\033[1;33m'
 NC='\033[0m'
 
 echo "=================================="
@@ -49,13 +50,44 @@ test_endpoint() {
     fi
 }
 
+# Helper to check header
+test_header() {
+    local name="$1"
+    local endpoint="$2"
+    local header="$3"
+    local expected="$4"
+    
+    echo -n "Testing $name... "
+    
+    response=$(curl -sI "$BASE_URL$endpoint" 2>&1)
+    
+    if echo "$response" | grep -qi "$header.*$expected" 2>/dev/null; then
+        echo -e "${GREEN}✓ PASS${NC}"
+        PASS=$((PASS + 1))
+        return 0
+    else
+        echo -e "${RED}✗ FAIL${NC}"
+        echo "  Expected header: $header: $expected"
+        FAIL=$((FAIL + 1))
+        return 1
+    fi
+}
+
 echo "=== Core Endpoints ==="
 test_endpoint "Health Check" "GET" "/api/health" "" "healthy" || true
+test_endpoint "Ready Check" "GET" "/api/ready" "" "ready" || true
 test_endpoint "Tasks (empty)" "GET" "/api/tasks" "" '\[\]' || true
 
 echo ""
 echo "=== Static Files ==="
 test_endpoint "Index HTML" "GET" "/" "" "DOCTYPE" || true
+test_header "Cache-Control (HTML)" "/" "Cache-Control" "no-cache" || true
+test_header "Cache-Control (JS)" "/app.js" "Cache-Control" "max-age=3600" || true
+
+echo ""
+echo "=== Security Headers ==="
+test_header "X-Content-Type-Options" "/" "X-Content-Type-Options" "nosniff" || true
+test_header "X-Frame-Options" "/" "X-Frame-Options" "SAMEORIGIN" || true
 
 echo ""
 echo "=== Auth Endpoints ==="
@@ -64,6 +96,18 @@ test_endpoint "Login (bad creds)" "POST" "/api/auth/login" \
 
 test_endpoint "Forgot Password" "POST" "/api/auth/forgot-password" \
     '{"email":"test@test.com"}' "success" || true
+
+echo ""
+echo "=== Path Security ==="
+# Test path traversal protection
+response=$(curl -s "$BASE_URL/../../etc/passwd" 2>&1)
+if echo "$response" | grep -q "403\|404\|Forbidden\|Not Found" 2>/dev/null; then
+    echo -e "Testing Path Traversal Block... ${GREEN}✓ PASS${NC}"
+    PASS=$((PASS + 1))
+else
+    echo -e "Testing Path Traversal Block... ${RED}✗ FAIL${NC}"
+    FAIL=$((FAIL + 1))
+fi
 
 echo ""
 echo "=================================="

@@ -49,7 +49,9 @@ fn getStringFromValue(allocator: std.mem.Allocator, value: std.json.Value, field
 /// Parse request body JSON and extract fields
 /// If the JSON has a "result" array (SurrealDB format), extracts from first result
 pub fn parseRequestBody(allocator: std.mem.Allocator, body: []const u8, field_name: []const u8) ?[]const u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return null;
+    };
     defer parsed.deinit();
     
     return extractField(allocator, parsed.value, field_name);
@@ -72,7 +74,8 @@ fn extractField(allocator: std.mem.Allocator, value: std.json.Value, field_name:
                 return extractField(allocator, arr.items[0], field_name);
             }
         },
-        else => {},
+        else => {
+        },
     }
     return null;
 }

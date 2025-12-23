@@ -105,10 +105,8 @@ pub fn executeQuery(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
         // Check status
         const status = result.status;
         if (status == .ok or status == .created or status == .accepted) {
-            // Success! Return owned slice (transfer ownership)
-            const body = response_writer.writer.buffer;
-            response_writer.writer.buffer = &.{}; // Prevent deferred free
-            return try allocator.dupe(u8, body);
+            // Success! Return owned slice (only written bytes, not full capacity)
+            return response_writer.toOwnedSlice() catch return HttpError.InvalidResponse;
         } else if (@intFromEnum(status) >= 500) {
             // Server error - retry
             std.debug.print("⚠️ DB attempt {d}/{d}: HTTP {d}\n", .{ attempt + 1, MAX_RETRIES, @intFromEnum(status) });
