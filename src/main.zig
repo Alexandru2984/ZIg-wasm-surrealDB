@@ -3,8 +3,11 @@ const zap = @import("zap");
 const auth = @import("auth.zig");
 const email = @import("email.zig");
 const db = @import("db.zig");
+const validation = @import("validation.zig");
+const json_helper = @import("json.zig");
+const config = @import("config.zig");
 
-// User structure with profile and verification fields
+// user profile with verification
 const User = struct {
     id: u32,
     email: []const u8,
@@ -17,7 +20,7 @@ const User = struct {
     reset_expires: ?i64 = null,
 };
 
-// Task structure
+// task structure
 const Task = struct {
     id: u32,
     title: []const u8,
@@ -25,11 +28,16 @@ const Task = struct {
     user_id: []const u8,  // String ID for SurrealDB
 };
 
-// Global allocator
+// global allocator
 var allocator: std.mem.Allocator = undefined;
 
 pub fn main() !void {
     allocator = std.heap.page_allocator;
+
+    // Load app configuration from .env
+    config.load(allocator) catch |err| {
+        std.debug.print("⚠️ Could not load .env config: {} (using defaults)\n", .{err});
+    };
 
     // Initialize SurrealDB schema
     db.initSchema(allocator) catch |err| {
@@ -38,12 +46,13 @@ pub fn main() !void {
 
     var listener = zap.HttpListener.init(.{
         .port = 9000,
+        .interface = "127.0.0.1", // SECURITY: Only allow local connections (via Nginx)
         .on_request = handleRequest,
         .log = true,
     });
     try listener.listen();
 
-    std.debug.print("\n🦎 Task Manager with Auth running at http://localhost:9000\n\n", .{});
+    std.debug.print("\n🦎 Task Manager with Auth running at http://127.0.0.1:9000\n\n", .{});
 
     zap.start(.{
         .threads = 2,
@@ -63,9 +72,19 @@ fn handleRequest(r: zap.Request) anyerror!void {
 
 fn handleApi(r: zap.Request, path: []const u8) !void {
     r.setHeader("Content-Type", "application/json") catch {};
-    r.setHeader("Access-Control-Allow-Origin", "*") catch {};
+    
+    // SECURITY: CORS origin from .env config (defaults to * for development)
+    const cors_origin = config.getOrDefault("CORS_ORIGIN", "*");
+    r.setHeader("Access-Control-Allow-Origin", cors_origin) catch {};
     r.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS") catch {};
     r.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization") catch {};
+    r.setHeader("Access-Control-Allow-Credentials", "true") catch {};
+    
+    // SECURITY: Additional security headers
+    r.setHeader("X-Content-Type-Options", "nosniff") catch {};
+    r.setHeader("X-Frame-Options", "DENY") catch {};
+    r.setHeader("Referrer-Policy", "strict-origin-when-cross-origin") catch {};
+    r.setHeader("X-XSS-Protection", "1; mode=block") catch {};
 
     if (r.method) |method| {
         if (std.mem.eql(u8, method, "OPTIONS")) {
@@ -141,7 +160,7 @@ fn handleApi(r: zap.Request, path: []const u8) !void {
     }
 }
 
-// Get current user ID from Authorization header
+// Get current user ID from Authorization header using secure session validation
 fn getCurrentUserId(r: zap.Request) ?[]const u8 {
     const auth_header = r.getHeader("authorization") orelse return null;
     
@@ -149,8 +168,9 @@ fn getCurrentUserId(r: zap.Request) ?[]const u8 {
     if (!std.mem.startsWith(u8, auth_header, "Bearer ")) return null;
     const token = auth_header[7..];
     
-    const user_id_str = auth.validateToken(allocator, token) catch return null;
-    return user_id_str;
+    // Validate session token in database
+    const user_id = db.validateSession(allocator, token) catch return null;
+    return user_id;
 }
 
 fn handleSignup(r: zap.Request) !void {
@@ -166,6 +186,13 @@ fn handleSignup(r: zap.Request) !void {
         try r.sendBody("{\"error\": \"Missing email\"}");
         return;
     };
+    
+    // SECURITY: Validate email format
+    if (!validation.validateEmail(user_email)) {
+        r.setStatus(.bad_request);
+        try r.sendBody("{\"error\": \"Invalid email format\"}");
+        return;
+    }
 
     // Parse password
     const password = parseJsonField(body, "password") orelse {
@@ -173,9 +200,28 @@ fn handleSignup(r: zap.Request) !void {
         try r.sendBody("{\"error\": \"Missing password\"}");
         return;
     };
+    
+    // SECURITY: Validate password strength
+    const pwd_result = validation.validatePasswordStrength(password);
+    if (!pwd_result.valid) {
+        r.setStatus(.bad_request);
+        if (pwd_result.too_short) {
+            try r.sendBody("{\"error\": \"Password must be at least 8 characters\"}");
+        } else {
+            try r.sendBody("{\"error\": \"Password is too long\"}");
+        }
+        return;
+    }
 
     // Parse name
     const name = parseJsonField(body, "name") orelse "User";
+    
+    // SECURITY: Validate name
+    if (!validation.validateName(name)) {
+        r.setStatus(.bad_request);
+        try r.sendBody("{\"error\": \"Invalid name format\"}");
+        return;
+    }
 
     // Check if email exists in SurrealDB
     if (db.getUserByEmail(allocator, user_email)) |result| {
@@ -191,8 +237,8 @@ fn handleSignup(r: zap.Request) !void {
     const password_hash = try auth.hashPassword(allocator, password);
 
     // Generate verification code (6 digits)
+    // SECURITY: Code is sent via email only, never logged
     const verification_code = try auth.generateVerificationCode(allocator);
-    std.debug.print("DEBUG: Verification code for {s}: {s}\n", .{user_email, verification_code});
 
     // Create user in SurrealDB
     const db_result = db.createUser(allocator, user_email, password_hash, name, verification_code) catch {
@@ -211,8 +257,13 @@ fn handleSignup(r: zap.Request) !void {
         std.debug.print("Failed to send confirmation email: {}\n", .{err});
     };
 
-    // Create login token using DB user ID
-    const token = try auth.createToken(allocator, user_id);
+    // Create secure session token (stored in DB)
+    const token = db.createSession(allocator, user_id) catch {
+        r.setStatus(.internal_server_error);
+        try r.sendBody("{\"error\": \"Failed to create session\"}");
+        return;
+    };
+    defer allocator.free(token);
 
     var response: [512]u8 = undefined;
     const len = (std.fmt.bufPrint(&response, "{{\"token\":\"{s}\",\"user\":{{\"id\":\"{s}\",\"email\":\"{s}\",\"name\":\"{s}\",\"email_verified\":false}}}}", .{
@@ -259,7 +310,14 @@ fn handleLogin(r: zap.Request) !void {
         if (valid) {
             const user_id = parseJsonField(db_result, "id") orelse "unknown";
             const user_name = parseJsonField(db_result, "name") orelse "User";
-            const token = try auth.createToken(allocator, user_id);
+            
+            // Create secure session token (stored in DB)
+            const token = db.createSession(allocator, user_id) catch {
+                r.setStatus(.internal_server_error);
+                try r.sendBody("{\"error\": \"Failed to create session\"}");
+                return;
+            };
+            defer allocator.free(token);
             
             var response: [512]u8 = undefined;
             const len = (std.fmt.bufPrint(&response, "{{\"token\":\"{s}\",\"user\":{{\"id\":\"{s}\",\"email\":\"{s}\",\"name\":\"{s}\"}}}}", .{
@@ -285,6 +343,7 @@ fn handleMe(r: zap.Request) !void {
         try r.sendBody("{\"error\": \"Not authenticated\"}");
         return;
     };
+    defer allocator.free(user_id); // SECURITY: Free owned memory from validateSession
 
     // Query user from DB
     const db_result = db.getUserById(allocator, user_id) catch {
@@ -316,6 +375,7 @@ fn getTasks(r: zap.Request) !void {
         try r.sendBody("[]");
         return;
     };
+    defer allocator.free(user_id); // SECURITY: Free owned memory
 
     // Query tasks from SurrealDB
     const db_result = db.getTasksByUser(allocator, user_id) catch {
@@ -350,6 +410,7 @@ fn createTask(r: zap.Request) !void {
         try r.sendBody("{\"error\": \"Login required\", \"useLocal\": true}");
         return;
     };
+    defer allocator.free(user_id); // SECURITY: Free owned memory
 
     const body = r.body orelse {
         r.setStatus(.bad_request);
@@ -407,6 +468,27 @@ fn createTask(r: zap.Request) !void {
 }
 
 fn toggleTask(r: zap.Request, task_id: []const u8) !void {
+    // SECURITY: Verify ownership before toggling
+    const user_id = getCurrentUserId(r) orelse {
+        r.setStatus(.unauthorized);
+        try r.sendBody("{\"error\": \"Unauthorized\"}");
+        return;
+    };
+    defer allocator.free(user_id); // SECURITY: Free owned memory
+    
+    // Check if this task belongs to the current user
+    const is_owner = db.verifyTaskOwnership(allocator, task_id, user_id) catch {
+        r.setStatus(.internal_server_error);
+        try r.sendBody("{\"error\": \"Failed to verify ownership\"}");
+        return;
+    };
+    
+    if (!is_owner) {
+        r.setStatus(.forbidden);
+        try r.sendBody("{\"error\": \"Forbidden: not your task\"}");
+        return;
+    }
+    
     const db_result = db.toggleTask(allocator, task_id) catch {
         r.setStatus(.internal_server_error);
         try r.sendBody("{\"error\": \"Failed to toggle task\"}");
@@ -429,6 +511,27 @@ fn toggleTask(r: zap.Request, task_id: []const u8) !void {
 }
 
 fn deleteTask(r: zap.Request, task_id: []const u8) !void {
+    // SECURITY: Verify ownership before deleting
+    const user_id = getCurrentUserId(r) orelse {
+        r.setStatus(.unauthorized);
+        try r.sendBody("{\"error\": \"Unauthorized\"}");
+        return;
+    };
+    defer allocator.free(user_id); // SECURITY: Free owned memory
+    
+    // Check if this task belongs to the current user
+    const is_owner = db.verifyTaskOwnership(allocator, task_id, user_id) catch {
+        r.setStatus(.internal_server_error);
+        try r.sendBody("{\"error\": \"Failed to verify ownership\"}");
+        return;
+    };
+    
+    if (!is_owner) {
+        r.setStatus(.forbidden);
+        try r.sendBody("{\"error\": \"Forbidden: not your task\"}");
+        return;
+    }
+    
     _ = db.deleteTask(allocator, task_id) catch {
         r.setStatus(.internal_server_error);
         try r.sendBody("{\"error\": \"Failed to delete task\"}");
@@ -439,18 +542,33 @@ fn deleteTask(r: zap.Request, task_id: []const u8) !void {
     try r.sendBody("{\"success\": true}");
 }
 
+// JSON field parser using proper std.json (handles spaces, escapes, field order)
+// NOTE: Returns owned memory that MUST be freed by caller when result is not null
 fn parseJsonField(body: []const u8, field: []const u8) ?[]const u8 {
-    var search_buf: [64]u8 = undefined;
-    const search = std.fmt.bufPrint(&search_buf, "\"{s}\":\"", .{field}) catch return null;
-    
-    const start = std.mem.indexOf(u8, body, search) orelse return null;
-    const content_start = start + search.len;
-    const end = std.mem.indexOfPos(u8, body, content_start, "\"") orelse return null;
-    
-    return body[content_start..end];
+    // Use proper JSON parsing from json.zig helper
+    return json_helper.parseRequestBody(allocator, body, field);
 }
 
 fn serveStatic(r: zap.Request, path: []const u8) !void {
+    // SECURITY: Block path traversal attacks
+    if (std.mem.indexOf(u8, path, "..") != null) {
+        std.debug.print("🚫 Path traversal blocked: {s}\n", .{path});
+        r.setStatus(.forbidden);
+        try r.sendBody("403 Forbidden");
+        return;
+    }
+    
+    // SECURITY: Block hidden files and sensitive paths
+    if (std.mem.startsWith(u8, path, "/.") or 
+        std.mem.indexOf(u8, path, "/.") != null or
+        std.mem.eql(u8, path, "/db_settings.txt") or
+        std.mem.eql(u8, path, "/mail_settings.txt")) {
+        std.debug.print("🚫 Hidden/sensitive file blocked: {s}\n", .{path});
+        r.setStatus(.not_found);
+        try r.sendBody("404 Not Found");
+        return;
+    }
+
     const file_path = if (std.mem.eql(u8, path, "/"))
         "public/index.html"
     else blk: {
@@ -458,6 +576,30 @@ fn serveStatic(r: zap.Request, path: []const u8) !void {
         const p = std.fmt.bufPrint(&buf, "public{s}", .{path}) catch "public/index.html";
         break :blk p;
     };
+    
+    // SECURITY: Verify resolved path stays within public directory
+    const cwd = std.fs.cwd();
+    const real_path = cwd.realpathAlloc(allocator, file_path) catch {
+        r.setStatus(.not_found);
+        try r.sendBody("404 Not Found");
+        return;
+    };
+    defer allocator.free(real_path);
+    
+    const public_base = cwd.realpathAlloc(allocator, "public") catch {
+        r.setStatus(.internal_server_error);
+        try r.sendBody("500 Server Error");
+        return;
+    };
+    defer allocator.free(public_base);
+    
+    // Ensure file is within public directory
+    if (!std.mem.startsWith(u8, real_path, public_base)) {
+        std.debug.print("🚫 Path escape blocked: {s} not in {s}\n", .{real_path, public_base});
+        r.setStatus(.forbidden);
+        try r.sendBody("403 Forbidden");
+        return;
+    }
 
     const ext = std.fs.path.extension(file_path);
     const content_type = if (std.mem.eql(u8, ext, ".html"))
@@ -468,12 +610,29 @@ fn serveStatic(r: zap.Request, path: []const u8) !void {
         "application/javascript"
     else if (std.mem.eql(u8, ext, ".wasm"))
         "application/wasm"
+    else if (std.mem.eql(u8, ext, ".png"))
+        "image/png"
+    else if (std.mem.eql(u8, ext, ".jpg") or std.mem.eql(u8, ext, ".jpeg"))
+        "image/jpeg"
+    else if (std.mem.eql(u8, ext, ".svg"))
+        "image/svg+xml"
+    else if (std.mem.eql(u8, ext, ".ico"))
+        "image/x-icon"
     else
         "application/octet-stream";
 
     r.setHeader("Content-Type", content_type) catch {};
+    
+    // SECURITY: Add security headers for static files
+    r.setHeader("X-Content-Type-Options", "nosniff") catch {};
+    r.setHeader("X-Frame-Options", "SAMEORIGIN") catch {};
+    r.setHeader("Referrer-Policy", "strict-origin-when-cross-origin") catch {};
+    
+    // Add CSP for HTML pages only
+    if (std.mem.eql(u8, ext, ".html")) {
+        r.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://task.micutu.com") catch {};
+    }
 
-    const cwd = std.fs.cwd();
     const file = cwd.openFile(file_path, .{}) catch {
         r.setStatus(.not_found);
         try r.sendBody("404 Not Found");
@@ -499,6 +658,7 @@ fn getProfile(r: zap.Request) !void {
         try r.sendBody("{\"error\": \"Not authenticated\"}");
         return;
     };
+    defer allocator.free(user_id); // SECURITY: Free owned memory
 
     // Query user from DB
     const db_result = db.getUserById(allocator, user_id) catch {
@@ -530,6 +690,7 @@ fn updateProfile(r: zap.Request) !void {
         try r.sendBody("{\"error\": \"Not authenticated\"}");
         return;
     };
+    defer allocator.free(user_id); // SECURITY: Free owned memory
 
     const body = r.body orelse {
         r.setStatus(.bad_request);
@@ -574,6 +735,7 @@ fn changePassword(r: zap.Request) !void {
         try r.sendBody("{\"error\": \"Not authenticated\"}");
         return;
     };
+    defer allocator.free(user_id); // SECURITY: Free owned memory
 
     const body = r.body orelse {
         r.setStatus(.bad_request);

@@ -3,6 +3,7 @@
 // No external dependencies (curl not needed)
 
 const std = @import("std");
+const config = @import("config.zig");
 
 // API config struct
 const EmailConfig = struct {
@@ -11,82 +12,27 @@ const EmailConfig = struct {
     from_name: []const u8,
 };
 
-// Global config
-var email_config: ?EmailConfig = null;
-var config_loaded = false;
-
-fn loadConfig(allocator: std.mem.Allocator) !EmailConfig {
-    if (config_loaded) {
-        return email_config orelse error.ConfigNotLoaded;
-    }
-
-    const file = std.fs.cwd().openFile("mail_settings.txt", .{}) catch |err| {
-        std.debug.print("❌ Cannot open mail_settings.txt: {}\n", .{err});
-        return err;
+// Get email config from unified .env config
+// Supports both old names (API_KEY, SEND_FROM) and new names (BREVO_API_KEY, FROM_EMAIL)
+fn getEmailConfig() !EmailConfig {
+    // Try new names first, then fall back to old names
+    const api_key = config.get("BREVO_API_KEY") orelse config.get("API_KEY") orelse {
+        std.debug.print("❌ Missing BREVO_API_KEY or API_KEY in .env\n", .{});
+        return error.MissingEmailConfig;
     };
-    defer file.close();
-
-    var buf: [4096]u8 = undefined;
-    const len = file.readAll(&buf) catch |err| {
-        std.debug.print("❌ Cannot read mail_settings.txt: {}\n", .{err});
-        return err;
+    
+    const from_email = config.get("FROM_EMAIL") orelse config.get("SEND_FROM") orelse {
+        std.debug.print("❌ Missing FROM_EMAIL or SEND_FROM in .env\n", .{});
+        return error.MissingEmailConfig;
     };
-
-    const content = buf[0..len];
-
-    var api_key: ?[]const u8 = null;
-    var from_email: ?[]const u8 = null;
-    var from_name: ?[]const u8 = null;
-
-    var lines = std.mem.splitSequence(u8, content, "\n");
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \r\t");
-        if (trimmed.len == 0 or trimmed[0] == '#') continue;
-
-        if (std.mem.indexOf(u8, trimmed, "=")) |eq_pos| {
-            const k = std.mem.trim(u8, trimmed[0..eq_pos], " ");
-            var v = std.mem.trim(u8, trimmed[eq_pos + 1 ..], " ");
-            
-            // Strip quotes from value if present
-            if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') {
-                v = v[1..v.len - 1];
-            }
-
-            // Accept both BREVO_API_KEY and API_KEY
-            if (std.mem.eql(u8, k, "BREVO_API_KEY") or std.mem.eql(u8, k, "API_KEY")) {
-                api_key = try allocator.dupe(u8, v);
-            } else if (std.mem.eql(u8, k, "SEND_FROM") or std.mem.eql(u8, k, "FROM_EMAIL")) {
-                from_email = try allocator.dupe(u8, v);
-            } else if (std.mem.eql(u8, k, "FROM_NAME")) {
-                from_name = try allocator.dupe(u8, v);
-            }
-            // Also support old SMTP_LOGIN as fallback for from_email
-            else if (from_email == null and std.mem.eql(u8, k, "SMTP_LOGIN")) {
-                from_email = try allocator.dupe(u8, v);
-            }
-        }
-    }
-
-    if (api_key == null) {
-        std.debug.print("❌ Missing BREVO_API_KEY in mail_settings.txt\n", .{});
-        return error.InvalidConfig;
-    }
-
-    if (from_email == null) {
-        std.debug.print("❌ Missing SEND_FROM or FROM_EMAIL in mail_settings.txt\n", .{});
-        return error.InvalidConfig;
-    }
-
-    email_config = EmailConfig{
-        .api_key = api_key.?,
-        .from_email = from_email.?,
-        .from_name = from_name orelse "Zig Task Manager",
+    
+    return EmailConfig{
+        .api_key = api_key,
+        .from_email = from_email,
+        .from_name = config.getOrDefault("FROM_NAME", "Zig Task Manager"),
     };
-    config_loaded = true;
-
-    std.debug.print("✅ Email config loaded (Brevo HTTP API)\n", .{});
-    return email_config.?;
 }
+
 
 pub fn sendConfirmationEmail(allocator: std.mem.Allocator, to_email: []const u8, name: []const u8, code: []const u8) !void {
     const subject = "Your Verification Code - Zig Task Manager";
@@ -166,7 +112,7 @@ pub fn sendPasswordResetEmail(allocator: std.mem.Allocator, to_email: []const u8
 }
 
 fn sendEmail(allocator: std.mem.Allocator, to_email: []const u8, to_name: []const u8, subject: []const u8, text_content: []const u8) !void {
-    const config = try loadConfig(allocator);
+    const email_cfg = try getEmailConfig();
 
     std.debug.print("📧 Sending email to: {s} via Brevo API\n", .{to_email});
 
@@ -213,7 +159,7 @@ fn sendEmail(allocator: std.mem.Allocator, to_email: []const u8, to_name: []cons
     
     const json_payload = try std.fmt.allocPrint(allocator,
         \\{{"sender":{{"name":"{s}","email":"{s}"}},"to":[{{"email":"{s}","name":"{s}"}}],"subject":"{s}","textContent":"{s}"}}
-    , .{ config.from_name, config.from_email, to_email, to_name_str, subject, escaped_buf[0..escaped_len] });
+    , .{ email_cfg.from_name, email_cfg.from_email, to_email, to_name_str, subject, escaped_buf[0..escaped_len] });
     defer allocator.free(json_payload);
 
     // Use std.http.Client with fetch API
@@ -226,7 +172,7 @@ fn sendEmail(allocator: std.mem.Allocator, to_email: []const u8, to_name: []cons
         .method = .POST,
         .payload = json_payload,
         .extra_headers = &[_]std.http.Header{
-            .{ .name = "api-key", .value = config.api_key },
+            .{ .name = "api-key", .value = email_cfg.api_key },
             .{ .name = "accept", .value = "application/json" },
             .{ .name = "content-type", .value = "application/json" },
         },
@@ -248,7 +194,7 @@ fn sendEmail(allocator: std.mem.Allocator, to_email: []const u8, to_name: []cons
 }
 
 fn sendHtmlEmail(allocator: std.mem.Allocator, to_email: []const u8, to_name: []const u8, subject: []const u8, html_content: []const u8) !void {
-    const config = try loadConfig(allocator);
+    const email_cfg = try getEmailConfig();
 
     std.debug.print("📧 Sending HTML email to: {s} via Brevo API\n", .{to_email});
 
@@ -291,7 +237,7 @@ fn sendHtmlEmail(allocator: std.mem.Allocator, to_email: []const u8, to_name: []
     
     const json_payload = try std.fmt.allocPrint(allocator,
         \\{{"sender":{{"name":"{s}","email":"{s}"}},"to":[{{"email":"{s}","name":"{s}"}}],"subject":"{s}","htmlContent":"{s}"}}
-    , .{ config.from_name, config.from_email, to_email, to_name_str, subject, escaped_buf[0..escaped_len] });
+    , .{ email_cfg.from_name, email_cfg.from_email, to_email, to_name_str, subject, escaped_buf[0..escaped_len] });
     defer allocator.free(json_payload);
 
     // Use std.http.Client with fetch API
@@ -304,7 +250,7 @@ fn sendHtmlEmail(allocator: std.mem.Allocator, to_email: []const u8, to_name: []
         .method = .POST,
         .payload = json_payload,
         .extra_headers = &[_]std.http.Header{
-            .{ .name = "api-key", .value = config.api_key },
+            .{ .name = "api-key", .value = email_cfg.api_key },
             .{ .name = "accept", .value = "application/json" },
             .{ .name = "content-type", .value = "application/json" },
         },
