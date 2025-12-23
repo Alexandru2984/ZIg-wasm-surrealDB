@@ -1,294 +1,257 @@
-Mai jos ai un plan de refactor „production-ish” pentru proiectul tău Zig (cu focus pe memory safety, uptime și structură clară). Îl poți aplica incremental, fără să-ți pice serverul în cap.
+Perfect. Îți las un plan în pași, ordonat de la cele mai grele / cu cel mai mare impact spre cele mai ușoare. E gândit să-l poți urma ca backlog (și să bifezi).
 
-0) Principiile (ca să știi de ce facem schimbările)
+Faza 0 — “Safety net” înainte de refactor (greu-ish, dar îți salvează nervii)
 
-Ținta e să obții:
+Freeze pe API contract
 
-ownership explicit (cine alocă / cine eliberează / cât trăiește memoria)
+Notează endpoint-urile + request/response JSON (și coduri HTTP) într-un docs/api.md.
 
-fără global mutable state
+Scop: după refactor, să știi sigur că n-ai stricat comportamentul.
 
-boundary-uri clare: app vs lib, transport vs business logic, db vs model
+Adaugă un “smoke test” script
 
-fără „borrowed slices” care devin invalide (mai ales din JSON)
+Un script (bash sau Zig) care face: signup → verify → login → me.
 
-timeouts/retry/logging pentru “online” (nu doar “merge local”)
+Scop: după fiecare milestone, rulezi scriptul și vezi instant dacă e ok.
 
-1) Re-aranjează proiectul în straturi
+Faza 1 — Cel mai greu & cel mai important: scoate sh -c curl din DB layer (P0)
+Obiectiv
 
-Structura recomandată:
+DB query să nu mai pornească procese și să nu mai treacă prin shell.
 
-src/
+Pașii
 
-main.zig – doar bootstrap + wiring
+Creează un modul nou: db/http_client.zig
 
-app.zig – AppState + start/stop + orchestrare
+Responsabil doar de HTTP POST către SurrealDB.
 
-config/ – Config loader + typed access
+Input: sql: []const u8
 
-http/ – router, handlers, request/response helpers
+Output: status, body (limită de ex. 1–4MB), plus error.
 
-domain/ – tipuri business (User, Post, EmailJob etc.)
+Implementare cu std.http.Client
 
-services/ – auth service, email service, post service
+Fă request:
 
-db/
+URL: http(s)://host/sql
 
-db.zig – interfață/contract (Repo)
+headers:
 
-surreal_repo.zig – implementare
+Content-Type: text/plain (sau cum cere Surreal)
 
-(mai târziu) pg_repo.zig
+Authorization: Basic <base64(user:pass)> (NU în argv, NU în logs)
 
-util/ – json helpers, validation, logging helpers
+Setează timeouts (connect/read) dacă API-ul din versiunea ta permite. Dacă nu, pune măcar limite de body + limită de retries.
 
-Regula: http nu știe detalii despre DB, doar cheamă services. services vorbesc cu db printr-o interfață.
+Body read “bounded”
 
-2) Elimină global state (config + orice altceva)
-Problema:
+Nu citi nelimitat.
 
-Globals = non-thread-safe + tricky lifetime + greu de testat.
+readAllAlloc(allocator, max_bytes) sau buclă care oprește la limită.
 
-Ținta:
+Partea de erori
 
-Ai un singur AppState care ține:
+Dacă status != 200/2xx:
 
-allocator(e)
+log status + body (dar trunchiat)
 
-config
+întoarce error typed (nu doar string).
 
-db repo
+Înlocuiește db/surreal.zig query()
 
-email client
+surreal.query() devine wrapper peste noul http_client.
 
-logger
+Ștergi complet std.process.Child.run și sh -c.
 
-orice cache
+Adaugă retry doar aici
 
-Exemplu conceptual:
+Retry/backoff la nivel DB (doar pentru erori de rețea / 5xx), nu pentru 4xx.
 
-AppState.init(allocator) !AppState
+Backoff: 200ms → 500ms → 1s (max 3 încercări).
 
-deinit() eliberează TOT în ordine.
+✅ La final: ai eliminat injection via shell, ai redus overhead-ul masiv, și ai control real pe timeouts/body.
 
-Câștig:
+Faza 2 — Memory safety reală: allocator per-request cu Arena (P0)
+Obiectiv
 
-memory ownership clar
+Zero leaks accidentale + cleanup garantat.
 
-testare ușoară
+Pașii
 
-“server online” fără surprize când crești
+În handler (la început), creezi arena
 
-3) Standardizează strategia de allocatori (asta îți dă “memory safe” în practică)
+var arena = std.heap.ArenaAllocator.init(gpa);
 
-În Zig, “memory safe” = ownership + discipline + detectare la test.
+defer arena.deinit();
 
-Recomandare “production-ish”:
+const a = arena.allocator();
 
-pentru server runtime:
+Regula:
 
-GeneralPurposeAllocator (GPA) ca allocator principal
+Tot ce ține de request (JSON parse, strings, db query body, template, etc.) folosește a.
 
-pentru fiecare request: un ArenaAllocator (request-scoped)
+Schimbă semnăturile helperelor
 
-pentru test/debug:
+parseJsonField(allocator, ...) rămâne, dar îi dai a.
 
-activează std.heap.GeneralPurposeAllocator(.{ .safety = true })
+Orice funcție care întoarce “owned” pe request → să folosească arena.
 
-rulează zig test + -Drelease-safe=false în debug ca să prindă leaks/UB
+Elimină multe free() manuale.
 
-Regula de aur:
+Boundary clar
 
-Datele care trebuie să trăiască doar cât request-ul → alocate în arena și nu se eliberează individual.
+Singurele lucruri care NU trebuie să fie în arena:
 
-Datele care trebuie să trăiască mai mult (config/app cache/db objects) → alocate cu allocatorul “app”.
+cache global, config global, resurse long-lived.
 
-4) Repară zona cea mai periculoasă: JSON ownership / lifetime
+În rest: arena.
 
-Ai zis (și eu am văzut tiparul) unde apar cele mai nasoale buguri:
+✅ La final: e aproape imposibil să “uiți” să eliberezi.
 
-parsezi JSON
+Faza 3 — SurrealQL injection hardening (P0)
+Obiectiv
 
-iei []const u8 din el
+Niciun input user nu ajunge “raw” în query.
 
-faci deinit()
+Pașii
 
-păstrezi slices care devin invalide
+Interzice string interpolation direct
 
-Refactor recomandat: 2 moduri (alegi unul și îl aplici consistent)
-Mod A (cel mai simplu, robust): “Parse → Copy → Deinit”
+Nu mai face "... {s} ..." cu input user.
 
-Parsezi JSON în request arena (sau temp)
+Creează un singur entrypoint pentru escaping
 
-Extragi stringuri/fields și le copiezi în arena sau în allocatorul de care ai nevoie
+db.escape(value) și îl folosești obligatoriu.
 
-Deinit parse imediat
+În code review: dacă vezi {s} cu input user → bug.
 
-Câștig: nu mai ai “dangling slice”.
+Normalizează + validează înainte de escape
 
-Mod B (mai performant, mai strict): “DOM lives as long as you need it”
+ex: email -> lower + trim
 
-Ții obiectul parsed (și buffer-ul sursă) viu până termini cu el
+nume -> trim + length cap
 
-Interzis să returnezi slices în afara scope-ului lui
+parolă -> nu o bagi niciodată în query (doar hash)
 
-Recomandare: pentru server, Mod A e aproape mereu mai safe și suficient.
+Dacă Surreal suportă parametri/bind
 
-5) Config: fă-l un obiect imutabil după init
+Folosește asta în loc de interpolation.
 
-Refactor din:
+Dacă nu: construiește query-uri doar cu string-uri escapate.
 
-var config: ?HashMap = null global
-în:
+✅ La final: nu te mai bazezi pe “poate merge”.
 
-Config struct cu map + allocator
+Faza 4 — Hash storage format “migrabil” (P1, dar important)
+Obiectiv
 
-Config.init(allocator, path)
+Să poți schimba parametrii Argon2 fără să rupi autentificarea.
 
-Config.deinit()
+Pașii
 
-Extra pentru “production-ish”
+Definește un format
 
-whitelist de chei (dacă lipsește ceva critic → fail fast la boot)
+ex: $argon2id$m=65536,t=3,p=4$<salt_hex>$<hash_hex>
 
-funcții typed: getBoolStrict, getIntStrict, getEnum
+Scrie encode_hash() și decode_hash()
 
-log friendly: să nu printezi secrete (mask)
+decode_hash() parsează parametrii și salt/hash.
 
-6) DB layer: definește un “Repo contract” ca să poți schimba SurrealDB ușor
+La login:
 
-Ținta ta e să poți:
+parsezi, rulezi Argon2 cu parametrii din string, compari.
 
-rămâne online acum cu Surreal
+Opțional: “rehash on login”
 
-dar să nu fii blocat când migrezi la Postgres
+Dacă parametrii vechi < parametrii noi:
 
-Ce faci:
+după login reușit, regenerezi hash și updatezi în DB.
 
-db/db.zig definește interfața (set de funcții) pe care services o folosesc:
+✅ La final: upgrade fără durere.
 
-createUser()
+Faza 5 — Static file serving corect (P1)
+Obiectiv
 
-getUserByEmail()
+Să nu poată citi fișiere din afara public/.
 
-createPost()
+Pașii
 
-listPosts()
+Decode URL path
 
-db/surreal_repo.zig implementează contractul
+Normalize path
 
-Regula: services nu “știe” SurrealDB, doar “Repo”.
+split pe /
 
-7) HTTP handlers: request-scoped arena + input validation clară
+ignoră .
 
-În fiecare handler:
+pentru .. -> pop, dar dacă pop când e gol => reject
 
-creezi ArenaAllocator din allocator principal
+Interzice absolute paths
 
-parse request body în arena
+dacă începe cu / după decode => tratează ca relative strict.
 
-validezi (validation.zig)
+Join cu root și verifică prefix
 
-chemi service
+root = realpath(public)
 
-construiești răspunsul (ideal tot în arena)
+file = realpath(root + relative) (dacă există)
 
-arena deinit la final
+dacă file nu începe cu root => reject 403
 
-Asta e unul dintre cele mai simple moduri să ai server Zig “ok-ish” fără leaks.
+MIME types + caching
 
-8) Auth: fă-l “safe enough” pentru producție (minimul absolut)
+set Content-Type corect
 
-Dacă ai login/parole:
+cache static: Cache-Control: public, max-age=...
 
-nu stoca parole în clar
+Faza 6 — Rate limiting & auth hardening (P1)
+Obiectiv
 
-folosește un KDF:
+Blochezi brute-force și spam.
 
-Argon2id e recomandarea modernă (în general)
+Pașii
 
-constant-time compare la verificare
+Implementare simplă în memorie
 
-rate limiting basic pe login (per IP / user)
+HashMap(ip -> counters + window_start)
 
-session tokens:
+per endpoint: login/forgot/verify
 
-tokens random (CSPRNG)
+Algoritm
 
-expirare
+sliding window 60s sau fixed window
 
-Dacă proiectul e doar intern, măcar:
+ex: max 10 requests / min / IP
 
-hashing + salt + expiring sessions
+Răspuns
 
-9) Email: timeouts, retries, queue (chiar simplă)
+429 Too Many Requests
 
-Ca să fie “online” fără nervi:
+Retry-After: ...
 
-set timeout la request SMTP/API
+Persistență (opțional)
 
-retry cu backoff:
+dacă ai mai multe instanțe: Redis. Dacă nu, în mem e ok.
 
-ex: 1s, 2s, 5s, 10s (max 5 încercări)
+Faza 7 — Logging & observability minim (P2, dar te ajută mult)
 
-log pentru fiecare fail + reason
+Request ID
 
-ideal: coadă simplă (in-memory) și worker thread
+generezi random hex 8–16 bytes
 
-dacă pică email providerul → serverul nu moare, doar marchează job fail
+îl pui în logs și în response header X-Request-ID
 
-10) Logging și observabilitate (minim viabil)
+Log format
 
-logger unificat (nu std.debug.print peste tot)
+JSON logs: {ts, level, req_id, ip, method, path, status, ms}
 
-nivele: info/warn/error
+Metrics endpoint
 
-request id în log (random sau increment)
+/metrics (chiar și text simplu)
 
-log “startup config summary” (fără secrete)
+counters: requests_total, errors_total, db_latency_ms_bucket
 
-health endpoint /health:
+Faza 8 — Health/Ready (P2)
 
-ok dacă db conectat + app state valid
+/health: return 200 mereu dacă procesul e up
 
-11) Graceful shutdown + resiliență
-
-Pentru uptime:
-
-catch SIGTERM/SIGINT
-
-oprești acceptarea de conexiuni noi
-
-lași request-urile în curs să termine (cu timeout)
-
-deinit() curat (db client, email worker, etc.)
-
-12) Teste + “safety gates”
-
-Ținta e să prinzi:
-
-leaks
-
-use-after-free
-
-invalid lifetime din JSON
-
-regresii
-
-Minime:
-
-zig test pentru:
-
-config parser
-
-validation
-
-json helper (mai ales!)
-
-db mock tests pentru services
-
-Gate de release:
-
-rulezi testele cu allocator safety activ
-
-rulezi un load test mic (10-100 req/s) și verifici că nu crește RAM continuu
+/ready: verifică DB query simplu + config essential

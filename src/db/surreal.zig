@@ -1,10 +1,12 @@
 // SurrealDB Client Module for Zig Task Manager
 // Uses HTTP REST API to communicate with SurrealDB
 // SECURITY: All user inputs MUST be escaped using escape() before SQL interpolation
+// NOTE: Now using native HTTP client (no more shell subprocess!)
 
 const std = @import("std");
 const config = @import("../config/config.zig");
 const validation = @import("../util/validation.zig");
+const http_client = @import("http_client.zig");
 
 // SECURITY: Escape string for safe SQL interpolation
 // Uses validation.sanitizeForSurrealQL to prevent SQL injection
@@ -12,7 +14,7 @@ fn escape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     return validation.sanitizeForSurrealQL(allocator, input);
 }
 
-// Database config struct
+// Database config struct (kept for compatibility)
 const DbConfig = struct {
     url: []const u8,
     ns: []const u8,
@@ -21,7 +23,7 @@ const DbConfig = struct {
     pass: []const u8,
 };
 
-// Get DB config from unified .env config
+// Get DB config from unified .env config (kept for schema init logging)
 fn getDbConfig() !DbConfig {
     return DbConfig{
         .url = config.getRequired("SURREAL_URL") catch return error.MissingDbConfig,
@@ -32,28 +34,10 @@ fn getDbConfig() !DbConfig {
     };
 }
 
-// Execute a SurrealQL query using curl
-// NOTE: Using curl temporarily - Zig 0.15 std.http.Client API does not support 
-// response body retrieval in a compatible way. SQL is sanitized before use.
+// Execute a SurrealQL query using native HTTP client
+// SECURITY: No more shell subprocess - uses std.http.Client directly
 pub fn query(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
-    const db_cfg = try getDbConfig();
-
-    // Build curl command - credentials are passed via -u flag (not in URL)
-    const curl_cmd = try std.fmt.allocPrint(allocator,
-        \\curl -s -X POST "{s}/sql" -H "Accept: application/json" -H "surreal-ns: {s}" -H "surreal-db: {s}" -u "{s}:{s}" --data-raw '{s}'
-    , .{ db_cfg.url, db_cfg.ns, db_cfg.db, db_cfg.user, db_cfg.pass, sql });
-    defer allocator.free(curl_cmd);
-
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &[_][]const u8{ "/bin/sh", "-c", curl_cmd },
-    }) catch |err| {
-        std.debug.print("❌ DB query failed: {}\n", .{err});
-        return err;
-    };
-    defer allocator.free(result.stderr);
-
-    return result.stdout;
+    return http_client.executeQuery(allocator, sql);
 }
 
 // Initialize database schema

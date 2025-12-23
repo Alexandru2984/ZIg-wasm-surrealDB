@@ -185,7 +185,7 @@ fn handleHealth(r: zap.Request) !void {
     // Simple health check - if we get here, app is running
     // Check DB connectivity by doing a simple query
     const db_ok = blk: {
-        const result = db.query(allocator, "SELECT 1;") catch break :blk false;
+        const result = db.query(allocator, "INFO FOR DB;") catch break :blk false;
         defer allocator.free(result);
         break :blk true;
     };
